@@ -2,6 +2,13 @@ import { normalizeNameForMCP } from '../../services/mcp/normalization.js'
 import { env } from '../env.js'
 
 export const COMPUTER_USE_MCP_SERVER_NAME = 'computer-use'
+export const CLI_HOST_PLATFORM_BUNDLE_ID = 'com.anthropic.claude-code.cli-no-window'
+
+export function isComputerUseSupportedPlatform(
+  platform: NodeJS.Platform = process.platform,
+): platform is 'darwin' | 'win32' {
+  return platform === 'darwin' || platform === 'win32'
+}
 
 /**
  * Sentinel bundle ID for the frontmost gate. Claude Code is a terminal — it has
@@ -10,13 +17,12 @@ export const COMPUTER_USE_MCP_SERVER_NAME = 'computer-use'
  * keyboard safety-net) is dead code for us. `prepareForAction`'s "exempt our
  * own window" is likewise a no-op — there is no window to exempt.
  */
-export const CLI_HOST_BUNDLE_ID = 'com.anthropic.claude-code.cli-no-window'
+export const CLI_HOST_BUNDLE_ID = CLI_HOST_PLATFORM_BUNDLE_ID
 
 /**
  * Fallback `env.terminal` → bundleId map for when `__CFBundleIdentifier` is
- * unset. Covers the macOS terminals we can distinguish — Linux entries
- * (konsole, gnome-terminal, xterm) are deliberately absent since
- * `createCliExecutor` is darwin-guarded.
+ * unset. Covers the macOS terminals we can distinguish. On Windows the host is
+ * always the CLI sentinel above, so this table remains macOS-specific.
  */
 const TERMINAL_BUNDLE_ID_FALLBACK: Readonly<Record<string, string>> = {
   'iTerm.app': 'com.googlecode.iterm2',
@@ -47,13 +53,32 @@ export function getTerminalBundleId(): string | null {
 }
 
 /**
- * Static capabilities for macOS CLI. `hostBundleId` is not here — it's added
- * by `executor.ts` per `ComputerExecutor.capabilities`. `buildComputerUseTools`
- * takes this shape (no `hostBundleId`, no `teachMode`).
+ * CLI computer-use capabilities by platform. `hostBundleId` is not here —
+ * it's added by `executor.ts` per `ComputerExecutor.capabilities`.
  */
-export const CLI_CU_CAPABILITIES = {
-  screenshotFiltering: 'native' as const,
-  platform: 'darwin' as const,
+export function getCliComputerUseCapabilities(
+  platform: NodeJS.Platform = process.platform,
+): {
+  screenshotFiltering: 'native' | 'none'
+  platform: 'darwin' | 'win32'
+} {
+  if (platform === 'darwin') {
+    return {
+      screenshotFiltering: 'native',
+      platform: 'darwin',
+    }
+  }
+
+  if (platform !== 'win32') {
+    throw new Error(
+      `Computer Use is only supported on macOS and Windows (received ${platform}).`,
+    )
+  }
+
+  return {
+    screenshotFiltering: 'none',
+    platform: 'win32',
+  }
 }
 
 export function isComputerUseMCPServer(name: string): boolean {

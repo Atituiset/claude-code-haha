@@ -420,6 +420,8 @@ function syncRemoteEvalToDisk(): void {
  * Check if GrowthBook operations should be enabled
  */
 function isGrowthBookEnabled(): boolean {
+  // No clientKey available in this fork — skip GrowthBook entirely.
+  if (!getGrowthBookClientKey()) return false
   // GrowthBook depends on 1P event logging.
   return is1PEventLoggingEnabled()
 }

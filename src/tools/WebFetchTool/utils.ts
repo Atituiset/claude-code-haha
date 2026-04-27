@@ -77,6 +77,19 @@ const DOMAIN_CHECK_CACHE = new LRUCache<string, true>({
   ttl: 5 * 60 * 1000, // 5 minutes — shorter than URL_CACHE TTL
 })
 
+export function shouldSkipWebFetchPreflight(
+  settings: { skipWebFetchPreflight?: boolean } = getSettings_DEPRECATED(),
+): boolean {
+  if (settings.skipWebFetchPreflight !== undefined) {
+    return settings.skipWebFetchPreflight
+  }
+
+  // Desktop sessions often route through third-party providers or constrained
+  // corporate networks where Anthropic's domain preflight fails despite the
+  // actual target URL being reachable through the configured provider path.
+  return Boolean(process.env.CC_HAHA_DESKTOP_SERVER_URL)
+}
+
 export function clearWebFetchCache(): void {
   URL_CACHE.clear()
   DOMAIN_CHECK_CACHE.clear()
@@ -384,7 +397,7 @@ export async function getURLMarkdownContent(
     // This is for enterprise customers with restrictive security policies
     // that prevent outbound connections to claude.ai
     const settings = getSettings_DEPRECATED()
-    if (!settings.skipWebFetchPreflight) {
+    if (!shouldSkipWebFetchPreflight(settings)) {
       const checkResult = await checkDomainBlocklist(hostname)
       switch (checkResult.status) {
         case 'allowed':

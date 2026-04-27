@@ -86,26 +86,31 @@ function findExecutable(executable: string): string | null {
  */
 export function setShellIfWindows(): void {
   if (getPlatform() === 'windows') {
-    const gitBashPath = findGitBashPath()
+    const gitBashPath = tryFindGitBashPath()
+    if (!gitBashPath) {
+      logForDebugging(
+        'Git Bash not found on Windows; leaving SHELL unset for lazy fallback handling',
+        { level: 'warn' },
+      )
+      return
+    }
     process.env.SHELL = gitBashPath
     logForDebugging(`Using bash path: "${gitBashPath}"`)
   }
 }
 
 /**
- * Find the path where `bash.exe` included with git-bash exists, exiting the process if not found.
+ * Best-effort Git Bash resolution on Windows.
+ *
+ * Returns null when Git Bash is unavailable so callers can decide whether to
+ * fall back (for example, to PowerShell) instead of hard-exiting the process.
  */
-export const findGitBashPath = memoize((): string => {
+export const tryFindGitBashPath = memoize((): string | null => {
   if (process.env.CLAUDE_CODE_GIT_BASH_PATH) {
     if (checkPathExists(process.env.CLAUDE_CODE_GIT_BASH_PATH)) {
       return process.env.CLAUDE_CODE_GIT_BASH_PATH
     }
-    // biome-ignore lint/suspicious/noConsole:: intentional console output
-    console.error(
-      `Claude Code was unable to find CLAUDE_CODE_GIT_BASH_PATH path "${process.env.CLAUDE_CODE_GIT_BASH_PATH}"`,
-    )
-    // eslint-disable-next-line custom-rules/no-process-exit
-    process.exit(1)
+    return null
   }
 
   const gitPath = findExecutable('git')
@@ -114,6 +119,27 @@ export const findGitBashPath = memoize((): string => {
     if (checkPathExists(bashPath)) {
       return bashPath
     }
+  }
+
+  return null
+})
+
+/**
+ * Find the path where `bash.exe` included with git-bash exists, exiting the process if not found.
+ */
+export const findGitBashPath = memoize((): string => {
+  const gitBashPath = tryFindGitBashPath()
+  if (gitBashPath) {
+    return gitBashPath
+  }
+
+  if (process.env.CLAUDE_CODE_GIT_BASH_PATH) {
+    // biome-ignore lint/suspicious/noConsole:: intentional console output
+    console.error(
+      `Claude Code was unable to find CLAUDE_CODE_GIT_BASH_PATH path "${process.env.CLAUDE_CODE_GIT_BASH_PATH}"`,
+    )
+    // eslint-disable-next-line custom-rules/no-process-exit
+    process.exit(1)
   }
 
   // biome-ignore lint/suspicious/noConsole:: intentional console output

@@ -16,7 +16,7 @@
  * GrowthBook gate `tengu_malort_pedway` (see gates.ts).
  */
 
-import { bindSessionContext, type ComputerUseSessionContext, type CuCallToolResult, type CuPermissionRequest, type CuPermissionResponse, DEFAULT_GRANT_FLAGS, type ScreenshotDims } from '@ant/computer-use-mcp';
+import { bindSessionContext, type ComputerUseSessionContext, type CuCallToolResult, type CuPermissionRequest, type CuPermissionResponse, DEFAULT_GRANT_FLAGS, type ScreenshotDims } from '../../vendor/computer-use-mcp/index.js';
 import * as React from 'react';
 import { getSessionId } from '../../bootstrap/state.js';
 import { ComputerUseApproval } from '../../components/permissions/ComputerUseApproval/ComputerUseApproval.js';
@@ -27,6 +27,10 @@ import { registerEscHotkey } from './escHotkey.js';
 import { getChicagoCoordinateMode } from './gates.js';
 import { getComputerUseHostAdapter } from './hostAdapter.js';
 import { getComputerUseMCPRenderingOverrides } from './toolRendering.js';
+import { resolveStoredComputerUseConfig } from './preauthorizedConfig.js';
+import { readFile } from 'node:fs/promises';
+import { join } from 'node:path';
+import { homedir } from 'node:os';
 type CallOverride = Pick<Tool, 'call'>['call'];
 type Binding = {
   ctx: ComputerUseSessionContext;
@@ -48,6 +52,7 @@ type Binding = {
  */
 let binding: Binding | undefined;
 let currentToolUseContext: ToolUseContext | undefined;
+const desktopServerUrl = process.env.CC_HAHA_DESKTOP_SERVER_URL;
 function tuc(): ToolUseContext {
   // Safe: `binding` is only populated when `currentToolUseContext` is set.
   // Called only from within `ctx` callbacks, which only fire during dispatch.
@@ -227,6 +232,113 @@ export function buildSessionContext(): ComputerUseSessionContext {
     formatLockHeldMessage: formatLockHeld
   };
 }
+
+async function runDesktopPermissionDialog(
+  req: CuPermissionRequest,
+  signal: AbortSignal,
+): Promise<CuPermissionResponse> {
+  if (!desktopServerUrl) {
+    throw new Error('Desktop server URL is not configured')
+  }
+
+  const response = await fetch(`${desktopServerUrl}/api/computer-use/request-access`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      sessionId: getSessionId(),
+      request: req
+    }),
+    signal
+  })
+
+  if (!response.ok) {
+    const message = await response.text().catch(() => '')
+    throw new Error(
+      `Desktop Computer Use approval failed (${response.status}): ${message || response.statusText}`,
+    )
+  }
+
+  return await response.json() as CuPermissionResponse
+}
+
+/**
+ * Load pre-authorized apps from ~/.claude/cc-haha/computer-use-config.json.
+ * Called once when the binding is first created. Pre-authorized apps
+ * are injected into appState so `getAllowedApps()` returns them
+ * immediately — no runtime permission dialog needed.
+ */
+async function loadPreAuthorizedApps(): Promise<void> {
+  let config:
+    | {
+        authorizedApps?: { bundleId: string; displayName: string }[]
+        grantFlags?: { clipboardRead?: boolean; clipboardWrite?: boolean; systemKeyCombos?: boolean }
+      }
+    | undefined
+
+  try {
+    const configPath = join(
+      process.env.CLAUDE_CONFIG_DIR ?? join(homedir(), '.claude'),
+      'cc-haha',
+      'computer-use-config.json',
+    )
+    const raw = await readFile(configPath, 'utf8')
+    config = JSON.parse(raw) as typeof config
+  } catch {
+    // Config doesn't exist yet — still honor desktop defaults for grant flags.
+  }
+
+  if (!currentToolUseContext) {
+    return
+  }
+
+  const resolved = resolveStoredComputerUseConfig(config)
+  const apps = resolved.authorizedApps.map(a => ({
+    bundleId: a.bundleId,
+    displayName: a.displayName,
+    grantedAt: Date.now(),
+    tier: 'full' as const,
+  }))
+  const flags = {
+    ...DEFAULT_GRANT_FLAGS,
+    ...resolved.grantFlags,
+  }
+
+  // Inject into appState so getAllowedApps()/getGrantFlags() return persisted
+  // desktop settings immediately, even when no apps are pre-authorized yet.
+  currentToolUseContext.setAppState(prev => {
+    const existing = prev.computerUseMcpState?.allowedApps ?? []
+    const existingIds = new Set(existing.map(a => a.bundleId))
+    const merged = [...existing, ...apps.filter(a => !existingIds.has(a.bundleId))]
+    const currentFlags = prev.computerUseMcpState?.grantFlags
+    const sameFlags =
+      currentFlags?.clipboardRead === flags.clipboardRead &&
+      currentFlags?.clipboardWrite === flags.clipboardWrite &&
+      currentFlags?.systemKeyCombos === flags.systemKeyCombos
+    const sameApps = existing.length === merged.length
+
+    if (sameFlags && sameApps) {
+      return prev
+    }
+
+    return {
+      ...prev,
+      computerUseMcpState: {
+        ...prev.computerUseMcpState,
+        allowedApps: merged,
+        grantFlags: flags,
+      },
+    }
+  })
+
+  logForDebugging(
+    `[Computer Use] Loaded ${apps.length} pre-authorized apps and grant flags from config`,
+  )
+}
+
+let preAuthLoaded = false
+
 function getOrBind(): Binding {
   if (binding) return binding;
   const ctx = buildSessionContext();
@@ -251,6 +363,12 @@ export function getComputerUseMCPToolOverrides(toolName: string): ComputerUseMCP
     const {
       dispatch
     } = getOrBind();
+
+    // Load pre-authorized apps on first tool call
+    if (!preAuthLoaded) {
+      preAuthLoaded = true;
+      await loadPreAuthorizedApps();
+    }
     const {
       telemetry,
       ...result
@@ -295,8 +413,20 @@ export function getComputerUseMCPToolOverrides(toolName: string): ComputerUseMCP
  */
 async function runPermissionDialog(req: CuPermissionRequest): Promise<CuPermissionResponse> {
   const context = tuc();
+  let desktopBridgeError: Error | undefined;
+  if (desktopServerUrl) {
+    try {
+      return await runDesktopPermissionDialog(req, context.abortController.signal);
+    } catch (error) {
+      desktopBridgeError = error instanceof Error ? error : new Error(String(error));
+      logForDebugging(`[Computer Use] Desktop approval bridge failed: ${desktopBridgeError.message}`);
+    }
+  }
   const setToolJSX = context.setToolJSX;
   if (!setToolJSX) {
+    if (desktopBridgeError) {
+      throw desktopBridgeError;
+    }
     // Shouldn't happen — main.tsx gate excludes non-interactive. Fail safe.
     return {
       granted: [],
