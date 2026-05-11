@@ -1,6 +1,7 @@
 import { act, render, screen, waitFor } from '@testing-library/react'
 import '@testing-library/jest-dom'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { useSettingsStore } from '../stores/settingsStore'
 
 const terminalMocks = vi.hoisted(() => {
   const terminalInstance = {
@@ -54,6 +55,7 @@ import { TerminalSettings } from './TerminalSettings'
 
 describe('TerminalSettings', () => {
   beforeEach(() => {
+    useSettingsStore.setState({ locale: 'en' })
     terminalMocks.available = false
     terminalMocks.spawn.mockReset()
     terminalMocks.write.mockReset()
@@ -88,6 +90,7 @@ describe('TerminalSettings', () => {
   it('shows a desktop-runtime empty state outside Tauri', () => {
     render(<TerminalSettings />)
 
+    expect(screen.getByText(/claude-haha/)).toBeInTheDocument()
     expect(screen.getByText('Desktop runtime required')).toBeInTheDocument()
     expect(terminalMocks.spawn).not.toHaveBeenCalled()
   })
@@ -104,6 +107,20 @@ describe('TerminalSettings', () => {
     expect(screen.getByText('/Users/test')).toBeInTheDocument()
     expect(terminalMocks.terminalInstance.open).toHaveBeenCalled()
     expect(terminalMocks.fitInstance.fit).toHaveBeenCalled()
+  })
+
+  it('starts in the provided cwd when embedded in a project session', async () => {
+    terminalMocks.available = true
+
+    render(<TerminalSettings cwd="/tmp/current-project" />)
+
+    await waitFor(() => {
+      expect(terminalMocks.spawn).toHaveBeenCalledWith({
+        cols: 80,
+        rows: 24,
+        cwd: '/tmp/current-project',
+      })
+    })
   })
 
   it('writes matching terminal output events into xterm', async () => {

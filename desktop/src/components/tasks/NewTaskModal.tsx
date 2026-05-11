@@ -12,6 +12,8 @@ import { describeCron, isValidCron, parseCron, type FrequencyKey } from '../../l
 import type { PermissionMode } from '../../types/settings'
 import type { CronTask } from '../../types/task'
 
+type NotificationChannel = 'desktop' | 'telegram' | 'feishu'
+
 type Props = {
   open: boolean
   onClose: () => void
@@ -91,11 +93,12 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
   const [frequency, setFrequency] = useState<FrequencyKey>(parsed?.frequency || 'daily')
   const [time, setTime] = useState(parsed?.time || '09:00')
   const [model, setModel] = useState(editTask?.model || '')
+  const [providerId, setProviderId] = useState<string | null | undefined>(editTask?.providerId)
   const [permissionMode, setPermissionMode] = useState<PermissionMode>((editTask?.permissionMode as PermissionMode) || 'default')
   const [folderPath, setFolderPath] = useState(editTask?.folderPath || defaultWorkDir)
   const [useWorktree, setUseWorktree] = useState(editTask?.useWorktree || false)
   const [notifyEnabled, setNotifyEnabled] = useState(editTask?.notification?.enabled || false)
-  const [notifyChannels, setNotifyChannels] = useState<('telegram' | 'feishu')[]>(editTask?.notification?.channels || [])
+  const [notifyChannels, setNotifyChannels] = useState<NotificationChannel[]>(editTask?.notification?.channels || [])
   const [isSubmitting, setIsSubmitting] = useState(false)
 
   // Enhanced scheduling state
@@ -117,7 +120,8 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
     description.trim() &&
     prompt.trim() &&
     (frequency !== 'customCron' || isValidCron(customCron)) &&
-    (frequency !== 'specificDays' || selectedDays.length > 0)
+    (frequency !== 'specificDays' || selectedDays.length > 0) &&
+    (!notifyEnabled || notifyChannels.length > 0)
 
   const handleSubmit = async () => {
     if (!canSubmit) return
@@ -129,6 +133,7 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
         cron: cronValue,
         prompt: prompt.trim(),
         model: model || undefined,
+        providerId,
         permissionMode: permissionMode !== 'default' ? permissionMode : undefined,
         folderPath: folderPath.trim() || undefined,
         useWorktree: useWorktree || undefined,
@@ -199,6 +204,8 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
           onPermissionModeChange={setPermissionMode}
           modelId={model}
           onModelChange={setModel}
+          providerId={providerId}
+          onProviderIdChange={setProviderId}
           folderPath={folderPath}
           onFolderPathChange={setFolderPath}
           useWorktree={useWorktree}
@@ -331,7 +338,12 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
             <input
               type="checkbox"
               checked={notifyEnabled}
-              onChange={(e) => setNotifyEnabled(e.target.checked)}
+              onChange={(e) => {
+                setNotifyEnabled(e.target.checked)
+                if (e.target.checked && notifyChannels.length === 0) {
+                  setNotifyChannels(['desktop'])
+                }
+              }}
               className="w-4 h-4 rounded border-[var(--color-border)] accent-[var(--color-brand)]"
             />
             <div>
@@ -342,6 +354,19 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
           {notifyEnabled && (
             <div className="flex flex-col gap-2 pl-7">
               <div className="flex items-center gap-4">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={notifyChannels.includes('desktop')}
+                    onChange={(e) => {
+                      setNotifyChannels((prev) =>
+                        e.target.checked ? [...prev, 'desktop'] : prev.filter((c) => c !== 'desktop'),
+                      )
+                    }}
+                    className="w-3.5 h-3.5 rounded border-[var(--color-border)] accent-[var(--color-brand)]"
+                  />
+                  <span className="text-sm text-[var(--color-text-primary)]">{t('newTask.notifyDesktop')}</span>
+                </label>
                 <label className={`flex items-center gap-2 ${isFeishuConfigured ? 'cursor-pointer' : 'opacity-50 cursor-not-allowed'}`}>
                   <input
                     type="checkbox"
@@ -377,10 +402,10 @@ export function NewTaskModal({ open, onClose, editTask }: Props) {
                   )}
                 </label>
               </div>
-              {!isFeishuConfigured && !isTelegramConfigured && (
+              {notifyChannels.length === 0 && (
                 <p className="text-xs text-[var(--color-warning)]">
                   <span className="material-symbols-outlined text-[12px] align-middle mr-1">warning</span>
-                  {t('newTask.noChannelConfigured')}
+                  {t('newTask.noChannelSelected')}
                 </p>
               )}
             </div>

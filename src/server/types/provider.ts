@@ -14,6 +14,15 @@ export const ApiFormatSchema = z.enum([
 ])
 export type ApiFormat = z.infer<typeof ApiFormatSchema>
 
+export const ProviderAuthStrategySchema = z.enum([
+  'api_key',
+  'auth_token',
+  'auth_token_empty_api_key',
+  'dual_same_token',
+  'dual_dummy',
+])
+export type ProviderAuthStrategy = z.infer<typeof ProviderAuthStrategySchema>
+
 export const ModelMappingSchema = z.object({
   main: z.string(),
   haiku: z.string(),
@@ -21,18 +30,28 @@ export const ModelMappingSchema = z.object({
   opus: z.string(),
 })
 
+export const AutoCompactWindowSchema = z.number().int().min(16000).max(10000000)
+export const ModelContextWindowsSchema = z.record(
+  z.string().min(1),
+  z.number().int().min(16000).max(10000000),
+)
+
 export const SavedProviderSchema = z.object({
   id: z.string(),
   presetId: z.string(),
   name: z.string().min(1),
   apiKey: z.string(),
+  authStrategy: ProviderAuthStrategySchema.optional(),
   baseUrl: z.string(),
   apiFormat: ApiFormatSchema.default('anthropic'),
   models: ModelMappingSchema,
+  autoCompactWindow: AutoCompactWindowSchema.optional(),
+  modelContextWindows: ModelContextWindowsSchema.optional(),
   notes: z.string().optional(),
 })
 
 export const ProvidersIndexSchema = z.object({
+  schemaVersion: z.number().int().positive().optional(),
   activeId: z.string().nullable(),
   providers: z.array(SavedProviderSchema),
 })
@@ -41,18 +60,24 @@ export const CreateProviderSchema = z.object({
   presetId: z.string().min(1),
   name: z.string().min(1),
   apiKey: z.string(),
+  authStrategy: ProviderAuthStrategySchema.optional(),
   baseUrl: z.string(),
   apiFormat: ApiFormatSchema.default('anthropic'),
   models: ModelMappingSchema,
+  autoCompactWindow: AutoCompactWindowSchema.optional(),
+  modelContextWindows: ModelContextWindowsSchema.optional(),
   notes: z.string().optional(),
 })
 
 export const UpdateProviderSchema = z.object({
   name: z.string().min(1).optional(),
   apiKey: z.string().optional(),
+  authStrategy: ProviderAuthStrategySchema.optional(),
   baseUrl: z.string().optional(),
   apiFormat: ApiFormatSchema.optional(),
   models: ModelMappingSchema.optional(),
+  autoCompactWindow: AutoCompactWindowSchema.nullable().optional(),
+  modelContextWindows: ModelContextWindowsSchema.nullable().optional(),
   notes: z.string().optional(),
 })
 
@@ -60,6 +85,7 @@ export const TestProviderSchema = z.object({
   baseUrl: z.string().url(),
   apiKey: z.string().min(1),
   modelId: z.string().min(1),
+  authStrategy: ProviderAuthStrategySchema.optional(),
   apiFormat: ApiFormatSchema.default('anthropic'),
 })
 

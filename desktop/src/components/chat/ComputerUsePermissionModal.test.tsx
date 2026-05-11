@@ -73,12 +73,14 @@ vi.mock('../../api/computerUse', () => ({
 }))
 
 import { useChatStore } from '../../stores/chatStore'
+import { useSettingsStore } from '../../stores/settingsStore'
 import { ComputerUsePermissionModal } from './ComputerUsePermissionModal'
 
 describe('ComputerUsePermissionModal', () => {
   beforeEach(() => {
     sendMock.mockReset()
     openSettingsMock.mockReset()
+    useSettingsStore.setState({ locale: 'en' })
     useChatStore.setState({ sessions: {} })
   })
 

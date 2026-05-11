@@ -30,4 +30,22 @@ export type AdapterFileConfig = {
     defaultWorkDir?: string
     streamingCard?: boolean
   }
+  wechat?: {
+    accountId?: string
+    botToken?: string
+    baseUrl?: string
+    userId?: string
+    allowedUsers?: string[]
+    pairedUsers?: PairedUser[]
+    defaultWorkDir?: string
+  }
+  dingtalk?: {
+    clientId?: string
+    clientSecret?: string
+    allowedUsers?: string[]
+    pairedUsers?: PairedUser[]
+    defaultWorkDir?: string
+    endpoint?: string
+    permissionCardTemplateId?: string
+  }
 }

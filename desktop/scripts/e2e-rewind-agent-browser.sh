@@ -108,6 +108,8 @@ AB="agent-browser --session ${SESSION_NAME}"
 
 ${AB} open "${WEB_URL}"
 ${AB} wait 2000
+${AB} eval "localStorage.setItem('cc-haha-locale', 'en'); location.reload();"
+${AB} wait 2000
 ${AB} screenshot "${ARTIFACT_DIR}/01-home.png" >/dev/null
 
 ${AB} fill '#sidebar-search' "${UNIQUE_TITLE}"
@@ -135,10 +137,10 @@ fi
 
 ${AB} screenshot "${ARTIFACT_DIR}/03-after-edit.png" >/dev/null
 
-${AB} eval "const button = [...document.querySelectorAll('button')].find((node) => node.getAttribute('aria-label') === 'Rewind to here'); if (!button) throw new Error('Rewind button not found'); button.click();"
+${AB} find role button click --name "Undo current turn changes"
 ${AB} wait 1500
-${AB} screenshot "${ARTIFACT_DIR}/04-rewind-modal.png" >/dev/null
-${AB} find role button click --name "Rewind here"
+${AB} screenshot "${ARTIFACT_DIR}/04-undo-current-turn-confirm.png" >/dev/null
+${AB} find role button click --name "Undo current turn"
 
 for _ in $(seq 1 120); do
   if grep -q "before-rewind" "${TARGET_FILE}" && ! grep -q "after-rewind" "${TARGET_FILE}"; then

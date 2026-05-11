@@ -25,12 +25,27 @@ function extractUserText(message: any): string {
 const sdkUrl = getArg('--sdk-url')
 const sessionId = getArg('--session-id') || crypto.randomUUID()
 const initMode = process.env.MOCK_SDK_INIT_MODE || 'on_open'
+const initDelayMs = Number(process.env.MOCK_SDK_INIT_DELAY_MS || '0')
 const streamDelayMs = Number(process.env.MOCK_SDK_STREAM_DELAY_MS || '0')
+const exitAfterOpenMs = Number(process.env.MOCK_SDK_EXIT_AFTER_OPEN_MS || '0')
+const exitAfterFirstUserMs = Number(process.env.MOCK_SDK_EXIT_AFTER_FIRST_USER_MS || '0')
+const mcpStatusDelayMs = Number(process.env.MOCK_SDK_MCP_STATUS_DELAY_MS || '0')
+const startupStdout = process.env.MOCK_SDK_STARTUP_STDOUT || ''
+const exitBeforeSdkMs = Number(process.env.MOCK_SDK_EXIT_BEFORE_SDK_MS || '0')
 let initSent = false
+let firstUserExitScheduled = false
 
 if (!sdkUrl) {
   console.error('Missing --sdk-url')
   process.exit(1)
+}
+
+if (startupStdout) {
+  console.log(startupStdout)
+}
+
+if (exitBeforeSdkMs > 0) {
+  setTimeout(() => process.exit(1), exitBeforeSdkMs)
 }
 
 const ws = new WebSocket(sdkUrl)
@@ -49,7 +64,14 @@ function sendInit() {
 
 ws.addEventListener('open', () => {
   if (initMode !== 'on_first_user') {
-    sendInit()
+    if (initDelayMs > 0) {
+      setTimeout(sendInit, initDelayMs)
+    } else {
+      sendInit()
+    }
+  }
+  if (exitAfterOpenMs > 0) {
+    setTimeout(() => process.exit(1), exitAfterOpenMs)
   }
 })
 
@@ -63,7 +85,72 @@ ws.addEventListener('message', (event) => {
 
       if (parsed.type === 'user') {
         sendInit()
+        if (exitAfterFirstUserMs > 0 && !firstUserExitScheduled) {
+          firstUserExitScheduled = true
+          setTimeout(() => process.exit(1), exitAfterFirstUserMs)
+          continue
+        }
         const text = extractUserText(parsed)
+        const slashCommand = text.trim()
+        if (slashCommand === '/cost') {
+          emit(ws, {
+            type: 'system',
+            subtype: 'local_command_output',
+            content: 'Total cost: $0.0000\nTotal duration: 0s',
+            session_id: sessionId,
+          })
+          emit(ws, {
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            result: 'Total cost: $0.0000',
+            usage: { input_tokens: 0, output_tokens: 0 },
+            session_id: sessionId,
+          })
+          continue
+        }
+        if (slashCommand === '/context') {
+          emit(ws, {
+            type: 'system',
+            subtype: 'local_command_output',
+            content: '## Context Usage\n\n| Type | Tokens |\n| --- | ---: |\n| System prompt | 123 |',
+            session_id: sessionId,
+          })
+          emit(ws, {
+            type: 'result',
+            subtype: 'success',
+            is_error: false,
+            result: 'Context usage',
+            usage: { input_tokens: 0, output_tokens: 0 },
+            session_id: sessionId,
+          })
+          continue
+        }
+        if (text.includes('trigger api error')) {
+          emit(ws, {
+            type: 'assistant',
+            error: 'invalid_request',
+            isApiErrorMessage: true,
+            message: {
+              role: 'assistant',
+              content: [{ type: 'text', text: 'Prompt is too long' }],
+            },
+            session_id: sessionId,
+          })
+          if (text.includes('then exit')) {
+            setTimeout(() => process.exit(1), 10)
+            continue
+          }
+          emit(ws, {
+            type: 'result',
+            subtype: 'success',
+            is_error: true,
+            result: 'Prompt is too long',
+            usage: { input_tokens: 0, output_tokens: 0 },
+            session_id: sessionId,
+          })
+          continue
+        }
         emit(ws, {
           type: 'stream_event',
           event: { type: 'message_start' },
@@ -120,6 +207,105 @@ ws.addEventListener('message', (event) => {
           is_error: false,
           result: 'Interrupted',
           usage: { input_tokens: 0, output_tokens: 0 },
+          session_id: sessionId,
+        })
+      }
+
+      if (parsed.type === 'control_request' && parsed.request?.subtype === 'get_session_usage') {
+        emit(ws, {
+          type: 'control_response',
+          response: {
+            subtype: 'success',
+            request_id: parsed.request_id,
+            response: {
+              totalCostUSD: 0.1234,
+              costDisplay: '$0.1234',
+              hasUnknownModelCost: false,
+              totalAPIDuration: 4,
+              totalDuration: 43,
+              totalLinesAdded: 0,
+              totalLinesRemoved: 0,
+              totalInputTokens: 27000,
+              totalOutputTokens: 41,
+              totalCacheReadInputTokens: 0,
+              totalCacheCreationInputTokens: 0,
+              totalWebSearchRequests: 0,
+              models: [{
+                model: 'mock-opus',
+                displayName: 'mock-opus',
+                inputTokens: 27000,
+                outputTokens: 41,
+                cacheReadInputTokens: 0,
+                cacheCreationInputTokens: 0,
+                webSearchRequests: 0,
+                costUSD: 0.1234,
+                costDisplay: '$0.1234',
+                contextWindow: 200000,
+                maxOutputTokens: 8192,
+              }],
+            },
+          },
+          session_id: sessionId,
+        })
+      }
+
+      if (parsed.type === 'control_request' && parsed.request?.subtype === 'get_context_usage') {
+        emit(ws, {
+          type: 'control_response',
+          response: {
+            subtype: 'success',
+            request_id: parsed.request_id,
+            response: {
+              categories: [
+                { name: 'System prompt', tokens: 6800, color: '#8a8a8a' },
+                { name: 'MCP tools', tokens: 5900, color: '#06b6d4' },
+                { name: 'Messages', tokens: 2400, color: '#7c3aed' },
+                { name: 'Free space', tokens: 132000, color: '#a1a1aa' },
+              ],
+              totalTokens: 27000,
+              maxTokens: 200000,
+              rawMaxTokens: 200000,
+              percentage: 13,
+              gridRows: Array.from({ length: 10 }, (_, row) =>
+                Array.from({ length: 10 }, (_, col) => {
+                  const index = row * 10 + col
+                  return {
+                    color: index < 13 ? '#06b6d4' : '#a1a1aa',
+                    isFilled: index < 13,
+                    categoryName: index < 13 ? 'Used' : 'Free space',
+                    tokens: 2000,
+                    percentage: 1,
+                    squareFullness: index < 13 ? 1 : 0,
+                  }
+                }),
+              ),
+              model: 'mock-opus',
+              estimateOnly: parsed.request.estimateOnly === true,
+              memoryFiles: [],
+              mcpTools: [{ name: 'mock_tool', serverName: 'mock', tokens: 144, isLoaded: true }],
+              agents: [],
+              skills: { totalSkills: 1, includedSkills: 1, tokens: 3000, skillFrontmatter: [] },
+              isAutoCompactEnabled: true,
+              apiUsage: null,
+            },
+          },
+          session_id: sessionId,
+        })
+      }
+
+      if (parsed.type === 'control_request' && parsed.request?.subtype === 'mcp_status') {
+        if (mcpStatusDelayMs > 0) {
+          await delay(mcpStatusDelayMs)
+        }
+        emit(ws, {
+          type: 'control_response',
+          response: {
+            subtype: 'success',
+            request_id: parsed.request_id,
+            response: {
+              mcpServers: [{ name: 'mock', status: 'connected' }],
+            },
+          },
           session_id: sessionId,
         })
       }

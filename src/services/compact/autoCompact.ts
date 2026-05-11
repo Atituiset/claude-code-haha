@@ -41,7 +41,7 @@ export function getEffectiveContextWindowSize(model: string): number {
   if (autoCompactWindow) {
     const parsed = parseInt(autoCompactWindow, 10)
     if (!isNaN(parsed) && parsed > 0) {
-      contextWindow = Math.min(contextWindow, parsed)
+      contextWindow = parsed
     }
   }
 

@@ -145,11 +145,29 @@ export function getCurrentUsage(messages: Message[]): {
     const message = messages[i]
     const usage = message ? getTokenUsage(message) : undefined
     if (usage) {
-      return {
+      const normalizedUsage = {
         input_tokens: usage.input_tokens,
         output_tokens: usage.output_tokens,
         cache_creation_input_tokens: usage.cache_creation_input_tokens ?? 0,
         cache_read_input_tokens: usage.cache_read_input_tokens ?? 0,
+      }
+
+      // Zero-token usage is used in a few recovery/compaction paths as a
+      // placeholder for "stale or unavailable", not as a real token count.
+      if (
+        normalizedUsage.input_tokens === 0 &&
+        normalizedUsage.output_tokens === 0 &&
+        normalizedUsage.cache_creation_input_tokens === 0 &&
+        normalizedUsage.cache_read_input_tokens === 0
+      ) {
+        continue
+      }
+
+      return {
+        input_tokens: normalizedUsage.input_tokens,
+        output_tokens: normalizedUsage.output_tokens,
+        cache_creation_input_tokens: normalizedUsage.cache_creation_input_tokens,
+        cache_read_input_tokens: normalizedUsage.cache_read_input_tokens,
       }
     }
   }

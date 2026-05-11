@@ -2,6 +2,8 @@
  * Unified error handling utilities
  */
 
+import { diagnosticsService } from '../services/diagnosticsService.js'
+
 export class ApiError extends Error {
   constructor(
     public statusCode: number,
@@ -37,6 +39,12 @@ export function errorResponse(error: unknown): Response {
     )
   }
 
+  void diagnosticsService.recordEvent({
+    type: 'api_unhandled_error',
+    severity: 'error',
+    summary: error instanceof Error ? error.message : String(error),
+    details: error,
+  })
   console.error('[Server] Unexpected error:', error)
   return Response.json(
     { error: 'INTERNAL_ERROR', message: 'An unexpected error occurred' },

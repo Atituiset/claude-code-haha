@@ -2,7 +2,7 @@
  * Unit tests for Settings, Models, and Status APIs
  */
 
-import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
+import { describe, it, expect, beforeAll, beforeEach, afterEach } from 'bun:test'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as os from 'os'
@@ -11,6 +11,16 @@ import { handleSettingsApi } from '../api/settings.js'
 import { handleModelsApi } from '../api/models.js'
 import { handleStatusApi, resetUsage, addUsage } from '../api/status.js'
 import { ProviderService } from '../services/providerService.js'
+import {
+  clearOpenAIOAuthTokenCache,
+} from '../../services/openaiAuth/storage.js'
+import { plainTextStorage } from '../../utils/secureStorage/plainTextStorage.js'
+import {
+  clearKeychainCache,
+  primeKeychainCacheFromPrefetch,
+} from '../../utils/secureStorage/macOsKeychainHelpers.js'
+import type { OpenAIOAuthTokens } from '../../services/openaiAuth/types.js'
+import { getModelOptions } from '../../utils/model/modelOptions.js'
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 
@@ -21,6 +31,12 @@ let originalUserProfile: string | undefined
 let originalShell: string | undefined
 let originalPath: string | undefined
 let originalCliPath: string | undefined
+let originalAnthropicApiKey: string | undefined
+let originalAnthropicBaseUrl: string | undefined
+let originalAnthropicModel: string | undefined
+let originalAnthropicDefaultHaikuModel: string | undefined
+let originalAnthropicDefaultSonnetModel: string | undefined
+let originalAnthropicDefaultOpusModel: string | undefined
 
 async function setup() {
   tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), 'claude-test-'))
@@ -30,14 +46,33 @@ async function setup() {
   originalShell = process.env.SHELL
   originalPath = process.env.PATH
   originalCliPath = process.env.CLAUDE_CLI_PATH
+  originalAnthropicApiKey = process.env.ANTHROPIC_API_KEY
+  originalAnthropicBaseUrl = process.env.ANTHROPIC_BASE_URL
+  originalAnthropicModel = process.env.ANTHROPIC_MODEL
+  originalAnthropicDefaultHaikuModel = process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL
+  originalAnthropicDefaultSonnetModel = process.env.ANTHROPIC_DEFAULT_SONNET_MODEL
+  originalAnthropicDefaultOpusModel = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
   process.env.CLAUDE_CONFIG_DIR = tmpDir
   process.env.HOME = tmpDir
   process.env.USERPROFILE = tmpDir
   process.env.SHELL = '/bin/zsh'
   process.env.PATH = ''
+  delete process.env.ANTHROPIC_API_KEY
+  delete process.env.ANTHROPIC_BASE_URL
+  delete process.env.ANTHROPIC_MODEL
+  delete process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL
+  delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL
+  delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
+  clearKeychainCache()
+  primeKeychainCacheFromPrefetch(null)
+  clearOpenAIOAuthTokenCache()
 }
 
 async function teardown() {
+  plainTextStorage.delete()
+  clearKeychainCache()
+  clearOpenAIOAuthTokenCache()
+
   if (originalConfigDir !== undefined) {
     process.env.CLAUDE_CONFIG_DIR = originalConfigDir
   } else {
@@ -74,7 +109,48 @@ async function teardown() {
     delete process.env.CLAUDE_CLI_PATH
   }
 
+  if (originalAnthropicApiKey !== undefined) {
+    process.env.ANTHROPIC_API_KEY = originalAnthropicApiKey
+  } else {
+    delete process.env.ANTHROPIC_API_KEY
+  }
+
+  if (originalAnthropicBaseUrl !== undefined) {
+    process.env.ANTHROPIC_BASE_URL = originalAnthropicBaseUrl
+  } else {
+    delete process.env.ANTHROPIC_BASE_URL
+  }
+
+  if (originalAnthropicModel !== undefined) {
+    process.env.ANTHROPIC_MODEL = originalAnthropicModel
+  } else {
+    delete process.env.ANTHROPIC_MODEL
+  }
+
+  if (originalAnthropicDefaultHaikuModel !== undefined) {
+    process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = originalAnthropicDefaultHaikuModel
+  } else {
+    delete process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL
+  }
+
+  if (originalAnthropicDefaultSonnetModel !== undefined) {
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = originalAnthropicDefaultSonnetModel
+  } else {
+    delete process.env.ANTHROPIC_DEFAULT_SONNET_MODEL
+  }
+
+  if (originalAnthropicDefaultOpusModel !== undefined) {
+    process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = originalAnthropicDefaultOpusModel
+  } else {
+    delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
+  }
+
   await fs.rm(tmpDir, { recursive: true, force: true })
+}
+
+function saveTestOpenAIOAuthTokens(tokens: OpenAIOAuthTokens) {
+  plainTextStorage.update({ openaiCodexOauth: tokens })
+  clearOpenAIOAuthTokenCache()
 }
 
 /** 创建一个模拟 Request */
@@ -106,6 +182,17 @@ describe('SettingsService', () => {
     const svc = new SettingsService()
     const settings = await svc.getUserSettings()
     expect(settings).toEqual({})
+  })
+
+  it('should recover from malformed user settings after an upgrade', async () => {
+    await fs.writeFile(path.join(tmpDir, 'settings.json'), '{not json', 'utf-8')
+
+    const svc = new SettingsService()
+    const settings = await svc.getUserSettings()
+    const files = await fs.readdir(tmpDir)
+
+    expect(settings).toEqual({})
+    expect(files.some((name) => name.startsWith('settings.json.invalid-'))).toBe(true)
   })
 
   it('should write and read user settings', async () => {
@@ -156,6 +243,19 @@ describe('SettingsService', () => {
   it('should get default permission mode', async () => {
     const svc = new SettingsService()
     const mode = await svc.getPermissionMode()
+    expect(mode).toBe('default')
+  })
+
+  it('should ignore stale invalid permission modes from older installs', async () => {
+    await fs.writeFile(
+      path.join(tmpDir, 'settings.json'),
+      JSON.stringify({ defaultMode: 'legacy-yolo' }),
+      'utf-8',
+    )
+
+    const svc = new SettingsService()
+    const mode = await svc.getPermissionMode()
+
     expect(mode).toBe('default')
   })
 
@@ -324,6 +424,34 @@ describe('Models API', () => {
     expect(body.models[0].id).toContain('claude')
   })
 
+  it('GET /api/models should merge env-configured provider models with saved OpenAI OAuth models', async () => {
+    process.env.ANTHROPIC_API_KEY = 'deepseek-key'
+    process.env.ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic'
+    process.env.ANTHROPIC_MODEL = 'deepseek-v4-pro'
+    process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = 'deepseek-v4-flash'
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'deepseek-v4-pro'
+    process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'deepseek-v4-pro'
+    saveTestOpenAIOAuthTokens({
+      accessToken: 'access-token',
+      refreshToken: 'refresh-token',
+      expiresAt: Date.now() + 60_000,
+    })
+
+    const { req, url, segments } = makeRequest('GET', '/api/models')
+    const res = await handleModelsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    const ids = body.models.map((model: { id: string }) => model.id)
+
+    expect(ids).toContain('deepseek-v4-pro')
+    expect(ids).toContain('deepseek-v4-flash')
+    expect(ids).toContain('gpt-5.3-codex')
+    expect(ids).toContain('gpt-5.4')
+    expect(ids).toContain('gpt-5.4-mini')
+    expect(ids.filter((id: string) => id === 'deepseek-v4-pro')).toHaveLength(1)
+  })
+
   it('GET /api/models/current should return default model when not set', async () => {
     const { req, url, segments } = makeRequest('GET', '/api/models/current')
     const res = await handleModelsApi(req, url, segments)
@@ -331,6 +459,17 @@ describe('Models API', () => {
     expect(res.status).toBe(200)
     const body = await res.json()
     expect(body.model.id).toBe('claude-opus-4-7')
+  })
+
+  it('GET /api/models/current should respect env-configured default model when no provider is active', async () => {
+    process.env.ANTHROPIC_MODEL = 'deepseek-v4-pro'
+
+    const { req, url, segments } = makeRequest('GET', '/api/models/current')
+    const res = await handleModelsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.model.id).toBe('deepseek-v4-pro')
   })
 
   it('PUT /api/models/current should switch model', async () => {
@@ -427,6 +566,19 @@ describe('Models API', () => {
     expect(body.available).toEqual(['low', 'medium', 'high', 'max'])
   })
 
+  it('GET /api/effort should fall back when stored effort is stale', async () => {
+    const settingsSvc = new SettingsService()
+    await settingsSvc.updateUserSettings({ effort: 'turbo' })
+
+    const { req, url, segments } = makeRequest('GET', '/api/effort')
+    const res = await handleModelsApi(req, url, segments)
+
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body.level).toBe('medium')
+    expect(body.available).toEqual(['low', 'medium', 'high', 'max'])
+  })
+
   it('PUT /api/effort should set effort level', async () => {
     const { req, url, segments } = makeRequest('PUT', '/api/effort', { level: 'high' })
     const res = await handleModelsApi(req, url, segments)
@@ -447,6 +599,37 @@ describe('Models API', () => {
     const { req, url, segments } = makeRequest('GET', '/api/models/unknown')
     const res = await handleModelsApi(req, url, segments)
     expect(res.status).toBe(404)
+  })
+})
+
+describe('Model Options', () => {
+  beforeEach(setup)
+  afterEach(teardown)
+
+  it('should keep OpenAI OAuth models visible alongside env-configured provider models', () => {
+    process.env.ANTHROPIC_API_KEY = 'deepseek-key'
+    process.env.ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic'
+    process.env.ANTHROPIC_MODEL = 'deepseek-v4-pro'
+    process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL = 'deepseek-v4-flash'
+    process.env.ANTHROPIC_DEFAULT_SONNET_MODEL = 'deepseek-v4-pro'
+    process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = 'deepseek-v4-pro'
+    saveTestOpenAIOAuthTokens({
+      accessToken: 'access-token',
+      refreshToken: 'refresh-token',
+      expiresAt: Date.now() + 60_000,
+    })
+
+    const options = getModelOptions()
+    const values = options
+      .map(option => option.value)
+      .filter((value): value is string => typeof value === 'string')
+    const labels = options.map(option => option.label)
+
+    expect(values).toContain('gpt-5.3-codex')
+    expect(values).toContain('gpt-5.4')
+    expect(values).toContain('gpt-5.4-mini')
+    expect(labels).toContain('deepseek-v4-pro')
+    expect(labels).toContain('deepseek-v4-flash')
   })
 })
 
@@ -517,5 +700,61 @@ describe('Status API', () => {
     const { req, url, segments } = makeRequest('GET', '/api/status/nonexistent')
     const res = await handleStatusApi(req, url, segments)
     expect(res.status).toBe(404)
+  })
+})
+
+// =============================================================================
+// Activity Stats API
+// =============================================================================
+
+describe('Activity Stats API', () => {
+  let handleApiRequest: typeof import('../router.js').handleApiRequest
+
+  beforeAll(async () => {
+    ;({ handleApiRequest } = await import('../router.js'))
+  })
+
+  beforeEach(async () => {
+    await setup()
+  })
+
+  afterEach(teardown)
+
+  it('GET /api/activity-stats should default to the all range', async () => {
+    const { req, url } = makeRequest('GET', '/api/activity-stats')
+    const res = await handleApiRequest(req, url)
+
+    expect(res.status).toBe(200)
+
+    const body = await res.json()
+    expect(body.range).toBe('all')
+    expect(body.stats.totalSessions).toBe(0)
+    expect(new Date(body.generatedAt).toString()).not.toBe('Invalid Date')
+  })
+
+  it('GET /api/activity-stats/:range should return stats for supported ranges', async () => {
+    for (const range of ['7d', '30d', 'all'] as const) {
+      const { req, url } = makeRequest('GET', `/api/activity-stats/${range}`)
+      const res = await handleApiRequest(req, url)
+
+      expect(res.status).toBe(200)
+      const body = await res.json()
+      expect(body.range).toBe(range)
+      expect(body.stats).toBeDefined()
+    }
+  })
+
+  it('should reject non-GET methods', async () => {
+    const { req, url } = makeRequest('POST', '/api/activity-stats')
+    const res = await handleApiRequest(req, url)
+
+    expect(res.status).toBe(405)
+  })
+
+  it('should reject unknown activity stats ranges', async () => {
+    const { req, url } = makeRequest('GET', '/api/activity-stats/90d')
+    const res = await handleApiRequest(req, url)
+
+    expect(res.status).toBe(400)
   })
 })

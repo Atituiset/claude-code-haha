@@ -14,12 +14,19 @@ import { WsBridge, type ServerMessage, type AttachmentRef } from '../common/ws-b
 import { MessageDedup } from '../common/message-dedup.js'
 import { StreamingCard } from './streaming-card.js'
 import { enqueue } from '../common/chat-queue.js'
-import { loadConfig } from '../common/config.js'
+import { getConfiguredWorkDir, loadConfig } from '../common/config.js'
 import {
   formatImHelp,
   formatImStatus,
+  formatPermissionRequest,
   splitMessage,
 } from '../common/format.js'
+import {
+  formatPermissionDecisionStatus,
+  formatPermissionInstructions,
+  parsePermissionCommand,
+  type PermissionDecision,
+} from '../common/permission.js'
 import { SessionStore } from '../common/session-store.js'
 import { AdapterHttpClient, type RecentProject } from '../common/http-client.js'
 import { isAllowedUser, tryPair } from '../common/pairing.js'
@@ -49,7 +56,8 @@ const larkClient = new Lark.Client({
 const bridge = new WsBridge(config.serverUrl, 'feishu')
 const dedup = new MessageDedup()
 const sessionStore = new SessionStore()
-const httpClient = new AdapterHttpClient(config.serverUrl)
+const defaultWorkDir = getConfiguredWorkDir(config, config.feishu)
+const httpClient = new AdapterHttpClient(config.serverUrl, { allowedProjectRoots: [defaultWorkDir] })
 
 // Attachment plumbing — shared by inbound (download) and outbound (upload) paths.
 const attachmentStore = new AttachmentStore()
@@ -62,6 +70,7 @@ attachmentStore.gc().catch((err) => {
 const streamingCards = new Map<string, StreamingCard>()
 const pendingProjectSelection = new Map<string, boolean>()
 const runtimeStates = new Map<string, ChatRuntimeState>()
+const pendingPermissions = new Map<string, Set<string>>()
 
 // Per-chat outbound watchers for Agent-produced markdown image references.
 // `imageWatchers` extracts `![alt](src)` from streaming text;
@@ -204,6 +213,7 @@ function clearTransientChatState(chatId: string): void {
   runtime.state = 'idle'
   runtime.verb = undefined
   runtime.pendingPermissionCount = 0
+  pendingPermissions.delete(chatId)
 }
 
 async function ensureExistingSession(chatId: string): Promise<{ sessionId: string; workDir: string } | null> {
@@ -654,7 +664,7 @@ async function ensureSession(chatId: string): Promise<boolean> {
     return await bridge.waitForOpen(chatId)
   }
 
-  const workDir = config.defaultProjectDir
+  const workDir = defaultWorkDir
   if (workDir) {
     return await createSessionForChat(chatId, workDir)
   }
@@ -698,7 +708,7 @@ async function showProjectPicker(chatId: string): Promise<void> {
     const projects = await httpClient.listRecentProjects()
     if (projects.length === 0) {
       await sendText(chatId,
-        '没有找到最近的项目。请先在 Desktop App 中打开一个项目，或在设置中配置默认项目。')
+        `没有找到最近的项目。发送 /new 会使用默认工作目录：${defaultWorkDir}\n也可以发送 /new /path/to/project 指定项目。`)
       return
     }
     pendingProjectSelection.set(chatId, true)
@@ -708,7 +718,7 @@ async function showProjectPicker(chatId: string): Promise<void> {
       const lines = projects.slice(0, 10).map((p, i) =>
         `${i + 1}. **${p.projectName}**${p.branch ? ` (${p.branch})` : ''}\n   ${p.realPath}`
       )
-      await sendText(chatId, `选择项目（回复编号）：\n\n${lines.join('\n\n')}\n\n💡 下次可直接 /new <编号或名称> 快速新建会话`)
+      await sendText(chatId, `选择项目（回复编号）：\n\n${lines.join('\n\n')}\n\n💡 下次可直接 /new <编号、名称或绝对路径> 快速新建会话`)
     }
   } catch (err) {
     await sendText(chatId, `❌ 无法获取项目列表: ${err instanceof Error ? err.message : String(err)}`)
@@ -727,6 +737,7 @@ async function startNewSession(chatId: string, query?: string): Promise<void> {
   imageWatchers.delete(chatId)
   uploadedImageKeys.delete(chatId)
   pendingProjectSelection.delete(chatId)
+  pendingPermissions.delete(chatId)
   runtimeStates.delete(chatId)
 
   if (query) {
@@ -750,7 +761,7 @@ async function startNewSession(chatId: string, query?: string): Promise<void> {
       await sendText(chatId, `❌ ${err instanceof Error ? err.message : String(err)}`)
     }
   } else {
-    const workDir = config.defaultProjectDir
+    const workDir = defaultWorkDir
     if (workDir) {
       const ok = await createSessionForChat(chatId, workDir)
       if (ok) {
@@ -854,6 +865,9 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
     case 'permission_request': {
       runtime.pendingPermissionCount += 1
       runtime.state = 'permission_pending'
+      const pending = pendingPermissions.get(chatId) ?? new Set<string>()
+      pending.add(msg.requestId)
+      pendingPermissions.set(chatId, pending)
       const stored = sessionStore.get(chatId)
       const card = buildPermissionCard(
         msg.toolName,
@@ -861,7 +875,13 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
         msg.requestId,
         stored?.workDir,
       )
-      await sendCard(chatId, card)
+      const cardId = await sendCard(chatId, card)
+      if (!cardId) {
+        await sendText(
+          chatId,
+          `${formatPermissionRequest(msg.toolName, msg.input, msg.requestId)}\n\n${formatPermissionInstructions(msg.requestId)}`,
+        )
+      }
       break
     }
 
@@ -883,7 +903,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
           void card.abort(new Error('session reset')).catch(() => {})
         }
         const stored = sessionStore.get(chatId)
-        const workDir = stored?.workDir || config.defaultProjectDir
+        const workDir = stored?.workDir || defaultWorkDir
         if (workDir) {
           await sendText(chatId, '⚠️ 会话上下文已失效，正在自动重建...')
           bridge.resetSession(chatId)
@@ -997,6 +1017,12 @@ async function handleMessage(data: any): Promise<void> {
   enqueue(chatId, async () => {
     // ----- Commands (only when there are no attachments — `command + image`
     //       isn't a meaningful combo, so attachments always take precedence) -----
+
+    const permissionDecision = !hasAttachments ? parsePermissionCommand(msgText, pendingPermissions.get(chatId)) : null
+    if (permissionDecision) {
+      await handlePermissionDecision(chatId, permissionDecision)
+      return
+    }
 
     if (!hasAttachments && (msgText === '/new' || msgText === '新会话' || msgText.startsWith('/new '))) {
       const arg = msgText.startsWith('/new ') ? msgText.slice(5).trim() : ''
@@ -1141,6 +1167,31 @@ async function handleMessage(data: any): Promise<void> {
   })
 }
 
+function applyPermissionDecision(chatId: string, decision: PermissionDecision): boolean {
+  const { requestId, allowed, rule } = decision
+  const pending = pendingPermissions.get(chatId)
+  if (!pending?.has(requestId)) {
+    void sendText(chatId, `未找到待确认的权限请求：${requestId}`)
+    return false
+  }
+
+  const sent = bridge.sendPermissionResponse(chatId, requestId, allowed, rule)
+  if (!sent) {
+    void sendText(chatId, '权限响应发送失败，请检查会话状态。')
+    return false
+  }
+
+  pending.delete(requestId)
+  const runtime = getRuntimeState(chatId)
+  runtime.pendingPermissionCount = Math.max(0, runtime.pendingPermissionCount - 1)
+  return true
+}
+
+async function handlePermissionDecision(chatId: string, decision: PermissionDecision): Promise<void> {
+  const sent = applyPermissionDecision(chatId, decision)
+  if (sent) await sendText(chatId, `${formatPermissionDecisionStatus(decision)}。`)
+}
+
 async function handleCardAction(data: any): Promise<any> {
   const event = data as {
     operator?: { open_id?: string }
@@ -1167,9 +1218,12 @@ async function handleCardAction(data: any): Promise<any> {
     const rule = event.action?.value?.rule
     if (!requestId) return
 
-    bridge.sendPermissionResponse(chatId, requestId, allowed, rule)
-    const runtime = getRuntimeState(chatId)
-    runtime.pendingPermissionCount = Math.max(0, runtime.pendingPermissionCount - 1)
+    const sent = applyPermissionDecision(chatId, {
+      requestId,
+      allowed,
+      rule: rule === 'always' ? 'always' : undefined,
+    })
+    if (!sent) return { toast: { type: 'warning', content: '权限响应发送失败' } }
 
     const statusText = allowed
       ? rule === 'always'

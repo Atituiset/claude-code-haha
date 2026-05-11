@@ -1,3 +1,4 @@
+import { useCallback } from 'react'
 import { useSettingsStore } from '../stores/settingsStore'
 import { en, type TranslationKey } from './locales/en'
 import { zh } from './locales/zh'
@@ -38,8 +39,11 @@ export function translate(
  */
 export function useTranslation() {
   const locale = useSettingsStore((s) => s.locale)
-  return (key: TranslationKey, params?: Record<string, string | number>) =>
-    translate(locale, key, params)
+  return useCallback(
+    (key: TranslationKey, params?: Record<string, string | number>) =>
+      translate(locale, key, params),
+    [locale],
+  )
 }
 
 /**

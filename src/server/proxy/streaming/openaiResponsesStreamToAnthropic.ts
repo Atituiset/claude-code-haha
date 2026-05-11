@@ -4,6 +4,8 @@
  * Original work by Jason Young, MIT License
  */
 
+import { stringifyOpenAIToolArguments } from '../transform/toolArguments.js'
+
 type StreamState = {
   nextContentIndex: number
   indexByKey: Map<string, number>        // content part key → Anthropic index
@@ -216,7 +218,7 @@ function processEvent(
       const index = state.toolIndexByItemId.get(itemId)
       if (index === undefined) break
 
-      const delta = (data.delta as string) || ''
+      const delta = stringifyOpenAIToolArguments(data.delta)
       controller.enqueue(encoder.encode(formatSse('content_block_delta', {
         type: 'content_block_delta',
         index,
@@ -265,7 +267,10 @@ function processEvent(
       controller.enqueue(encoder.encode(formatSse('message_delta', {
         type: 'message_delta',
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: usage?.output_tokens ?? 0 },
+        usage: {
+          input_tokens: usage?.input_tokens ?? 0,
+          output_tokens: usage?.output_tokens ?? 0,
+        },
       })))
       if (!state.messageStopped) {
         state.messageStopped = true

@@ -110,6 +110,8 @@ describe('formatImHelp', () => {
     expect(text).toContain('/clear')
     expect(text).toContain('/stop')
     expect(text).toContain('/help')
+    expect(text).toContain('项目列表')
+    expect(text).toContain('/allow <id>')
   })
 })
 

@@ -1,13 +1,22 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import { App } from './App'
 import './theme/globals.css'
-import { initializeTheme } from './stores/uiStore'
+import { runDesktopPersistenceMigrations } from './lib/persistenceMigrations'
 
+runDesktopPersistenceMigrations()
+const [{ App }, { ErrorBoundary }, { installClientDiagnosticsCapture }, { initializeTheme }] = await Promise.all([
+  import('./App'),
+  import('./components/ErrorBoundary'),
+  import('./lib/diagnosticsCapture'),
+  import('./stores/uiStore'),
+])
 initializeTheme()
+installClientDiagnosticsCapture()
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
-    <App />
+    <ErrorBoundary>
+      <App />
+    </ErrorBoundary>
   </React.StrictMode>,
 )

@@ -262,11 +262,11 @@ function ToggleSwitch({
       disabled={disabled}
       onClick={onChange}
       className={`relative inline-flex h-8 w-14 items-center rounded-full transition-colors ${
-        checked ? 'bg-[#90c1f7]' : 'bg-[var(--color-border)]'
+        checked ? 'bg-[var(--color-switch-checked-bg)]' : 'bg-[var(--color-border)]'
       } ${disabled ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'}`}
     >
       <span
-        className={`inline-block h-6 w-6 transform rounded-full bg-white transition-transform ${
+        className={`inline-block h-6 w-6 transform rounded-full bg-[var(--color-switch-thumb)] shadow-sm transition-transform ${
           checked ? 'translate-x-7' : 'translate-x-1'
         }`}
       />

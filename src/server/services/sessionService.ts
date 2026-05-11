@@ -11,6 +11,20 @@ import * as os from 'node:os'
 import { ApiError } from '../middleware/errorHandler.js'
 import { sanitizePath as sanitizePortablePath } from '../../utils/sessionStoragePortable.js'
 import type { FileHistorySnapshot } from '../../utils/fileHistory.js'
+import { calculateUSDCost, MODEL_COSTS } from '../../utils/modelCost.js'
+import {
+  calculateCurrentContextTokenTotal,
+  MODEL_CONTEXT_WINDOW_DEFAULT,
+  getContextWindowForModel,
+  getModelMaxOutputTokens,
+} from '../../utils/context.js'
+import { getCanonicalName } from '../../utils/model/model.js'
+import {
+  resolveSessionWorkspaceLaunch,
+  type CreateSessionRepositoryOptions,
+  type PreparedSessionWorkspace,
+} from './repositoryLaunchService.js'
+import { cleanSessionTitleSource } from '../../utils/sessionTitleText.js'
 
 // ============================================================================
 // Types
@@ -35,6 +49,8 @@ export type SessionLaunchInfo = {
   filePath: string
   projectDir: string
   workDir: string
+  repository?: PreparedSessionWorkspace['repository']
+  worktreeSession?: PersistedWorktreeSession | null
   transcriptMessageCount: number
   customTitle: string | null
 }
@@ -55,6 +71,80 @@ export type MessageEntry = {
   isSidechain?: boolean
 }
 
+export type SessionTaskNotification = {
+  taskId: string
+  toolUseId: string
+  status: 'completed' | 'failed' | 'stopped'
+  summary?: string
+  outputFile?: string
+}
+
+export type TranscriptUsageSnapshot = {
+  source: 'transcript'
+  totalCostUSD: number
+  costDisplay: string
+  hasUnknownModelCost: boolean
+  totalAPIDuration: number
+  totalDuration: number
+  totalLinesAdded: number
+  totalLinesRemoved: number
+  totalInputTokens: number
+  totalOutputTokens: number
+  totalCacheReadInputTokens: number
+  totalCacheCreationInputTokens: number
+  totalWebSearchRequests: number
+  models: Array<{
+    model: string
+    displayName: string
+    inputTokens: number
+    outputTokens: number
+    cacheReadInputTokens: number
+    cacheCreationInputTokens: number
+    webSearchRequests: number
+    costUSD: number
+    costDisplay: string
+    contextWindow: number
+    maxOutputTokens: number
+  }>
+}
+
+export type TranscriptMetadataSnapshot = {
+  model?: string
+  cwd?: string
+  version?: string
+}
+
+export type TranscriptContextEstimate = {
+  categories: Array<{
+    name: string
+    tokens: number
+    color: string
+    isDeferred?: boolean
+  }>
+  totalTokens: number
+  maxTokens: number
+  rawMaxTokens: number
+  percentage: number
+  gridRows: Array<Array<{
+    color: string
+    isFilled: boolean
+    categoryName: string
+    tokens: number
+    percentage: number
+    squareFullness: number
+  }>>
+  model: string
+  memoryFiles: Array<{ path: string; type: string; tokens: number }>
+  mcpTools: Array<{ name: string; serverName: string; tokens: number; isLoaded?: boolean }>
+  agents: Array<{ agentType: string; source: string; tokens: number }>
+  apiUsage: {
+    input_tokens: number
+    output_tokens: number
+    cache_creation_input_tokens: number
+    cache_read_input_tokens: number
+  }
+}
+
 /** Raw entry parsed from a single JSONL line */
 type RawEntry = {
   type?: string
@@ -71,17 +161,43 @@ type RawEntry = {
     model?: string
     id?: string
     type?: string
+    usage?: {
+      input_tokens?: number
+      output_tokens?: number
+      cache_read_input_tokens?: number
+      cache_creation_input_tokens?: number
+      server_tool_use?: {
+        web_search_requests?: number
+      }
+      speed?: string
+    }
   }
   timestamp?: string
+  version?: string
   snapshot?: {
     messageId?: string
     trackedFileBackups?: Record<string, unknown>
     timestamp?: string
   }
   customTitle?: string
+  worktreeSession?: PersistedWorktreeSession | null
   title?: string
   [key: string]: unknown
 }
+
+type PersistedWorktreeSession = {
+  originalCwd: string
+  worktreePath: string
+  worktreeName: string
+  worktreeBranch?: string
+  originalBranch?: string
+  originalHeadCommit?: string
+  sessionId: string
+  tmuxSessionName?: string
+  hookBased?: boolean
+}
+
+type ContentBlock = Record<string, unknown>
 
 const USER_INTERRUPTION_TEXTS = new Set([
   '[Request interrupted by user]',
@@ -89,6 +205,8 @@ const USER_INTERRUPTION_TEXTS = new Set([
 ])
 
 const NO_RESPONSE_REQUESTED_TEXT = 'No response requested.'
+const TASK_NOTIFICATION_RE = /^<task-notification>\s*[\s\S]*<\/task-notification>$/i
+const TASK_NOTIFICATION_BLOCK_RE = /<task-notification>\s*[\s\S]*?<\/task-notification>/i
 
 // ============================================================================
 // Service
@@ -152,7 +270,8 @@ export class SessionService {
     entries: RawEntry[],
     fallbackProjectDir?: string,
   ): string | null {
-    for (const entry of entries) {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i]
       if (entry.type === 'session-meta' && typeof (entry as Record<string, unknown>).workDir === 'string') {
         return (entry as Record<string, unknown>).workDir as string
       }
@@ -166,6 +285,43 @@ export class SessionService {
     }
 
     return fallbackProjectDir ? this.desanitizePath(fallbackProjectDir) : null
+  }
+
+  private resolveRepositoryFromEntries(entries: RawEntry[]): PreparedSessionWorkspace['repository'] | undefined {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const repository = (entries[i] as Record<string, unknown>)?.repository
+      if (repository && typeof repository === 'object') {
+        return repository as PreparedSessionWorkspace['repository']
+      }
+    }
+    return undefined
+  }
+
+  private resolveWorktreeSessionFromEntries(entries: RawEntry[]): PersistedWorktreeSession | null | undefined {
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i]
+      if (entry?.type !== 'worktree-state') continue
+
+      const worktreeSession = entry.worktreeSession
+      if (worktreeSession === null) return null
+      if (
+        worktreeSession &&
+        typeof worktreeSession === 'object' &&
+        typeof worktreeSession.worktreePath === 'string' &&
+        typeof worktreeSession.worktreeName === 'string'
+      ) {
+        return worktreeSession
+      }
+    }
+    return undefined
+  }
+
+  private countTranscriptMessages(entries: RawEntry[]): number {
+    return entries.filter((entry) =>
+      !entry.isMeta &&
+      !!entry.message?.role &&
+      (entry.type === 'user' || entry.type === 'assistant' || entry.type === 'system')
+    ).length
   }
 
   // --------------------------------------------------------------------------
@@ -266,6 +422,72 @@ export class SessionService {
     )
   }
 
+  private isToolResultContent(content: unknown): boolean {
+    return (
+      Array.isArray(content) &&
+      content.some((block) =>
+        block &&
+        typeof block === 'object' &&
+        (block as Record<string, unknown>).type === 'tool_result'
+      )
+    )
+  }
+
+  private isTaskNotificationContent(content: unknown): boolean {
+    const textBlocks = this.extractTextBlocks(content)
+    return (
+      textBlocks.length > 0 &&
+      textBlocks.every((text) => this.extractTaskNotificationXml(text) !== null)
+    )
+  }
+
+  private extractTaskNotificationXml(text: string): string | null {
+    const trimmed = text.trim()
+    if (TASK_NOTIFICATION_RE.test(trimmed)) return trimmed
+    return trimmed.match(TASK_NOTIFICATION_BLOCK_RE)?.[0] ?? null
+  }
+
+  private decodeXmlText(text: string): string {
+    return text
+      .replace(/&lt;/g, '<')
+      .replace(/&gt;/g, '>')
+      .replace(/&quot;/g, '"')
+      .replace(/&#39;/g, "'")
+      .replace(/&amp;/g, '&')
+  }
+
+  private readXmlTag(xml: string, tag: string): string | undefined {
+    const match = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i'))
+    return match?.[1] ? this.decodeXmlText(match[1].trim()) : undefined
+  }
+
+  private parseTaskNotificationContent(content: unknown): SessionTaskNotification | null {
+    const xml = this.extractTextBlocks(content)
+      .map((text) => this.extractTaskNotificationXml(text))
+      .find((value): value is string => value !== null)
+    if (!xml) return null
+
+    const toolUseId = this.readXmlTag(xml, 'tool-use-id')
+    const status = this.readXmlTag(xml, 'status')
+    if (
+      !toolUseId ||
+      (status !== 'completed' && status !== 'failed' && status !== 'stopped')
+    ) {
+      return null
+    }
+
+    const taskId = this.readXmlTag(xml, 'task-id') || toolUseId
+    const summary = this.readXmlTag(xml, 'summary')
+    const outputFile = this.readXmlTag(xml, 'output-file')
+    return {
+      taskId,
+      toolUseId,
+      status,
+      ...(summary ? { summary } : {}),
+      ...(outputFile ? { outputFile } : {}),
+    }
+  }
+
   private shouldHideTranscriptEntry(entry: RawEntry): boolean {
     const role = entry.message?.role
     const content = entry.message?.content
@@ -273,7 +495,8 @@ export class SessionService {
     if (role === 'user') {
       return (
         this.isInternalCommandBreadcrumb(content) ||
-        this.isSyntheticUserInterruption(content)
+        this.isSyntheticUserInterruption(content) ||
+        this.isTaskNotificationContent(content)
       )
     }
 
@@ -299,6 +522,145 @@ export class SessionService {
     }
 
     return undefined
+  }
+
+  private extractAgentToolUseIdsFromMessage(message: MessageEntry): string[] {
+    if (message.type !== 'tool_use' || !Array.isArray(message.content)) {
+      return []
+    }
+
+    return (message.content as ContentBlock[])
+      .filter((block) => block.type === 'tool_use' && block.name === 'Agent')
+      .flatMap((block) => (typeof block.id === 'string' ? [block.id] : []))
+  }
+
+  private extractTextFromContent(content: unknown): string {
+    if (typeof content === 'string') return content
+    if (!Array.isArray(content)) return ''
+
+    return (content as ContentBlock[])
+      .flatMap((block) => (typeof block.text === 'string' ? [block.text] : []))
+      .join('\n')
+  }
+
+  private extractAgentIdFromResultText(text: string): string | undefined {
+    const match = text.match(/(?:^|\n)\s*agentId:\s*([A-Za-z0-9_-]+)/)
+    return match?.[1]
+  }
+
+  private extractAgentResultLinks(messages: MessageEntry[]): Map<string, string> {
+    const agentToolUseIds = new Set(
+      messages.flatMap((message) => this.extractAgentToolUseIdsFromMessage(message)),
+    )
+    const resultLinks = new Map<string, string>()
+
+    for (const message of messages) {
+      if (message.type !== 'tool_result' || !Array.isArray(message.content)) {
+        continue
+      }
+
+      for (const block of message.content as ContentBlock[]) {
+        if (block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') {
+          continue
+        }
+        if (!agentToolUseIds.has(block.tool_use_id)) {
+          continue
+        }
+
+        const agentId = this.extractAgentIdFromResultText(
+          this.extractTextFromContent(block.content),
+        )
+        if (agentId) {
+          resultLinks.set(block.tool_use_id, agentId)
+        }
+      }
+    }
+
+    return resultLinks
+  }
+
+  private namespaceSubagentContentIds(content: unknown, namespace: string): unknown {
+    if (!Array.isArray(content)) return content
+
+    return (content as ContentBlock[]).map((block) => {
+      if (!block || typeof block !== 'object') return block
+      if (block.type === 'tool_use' && typeof block.id === 'string') {
+        return { ...block, id: `${namespace}/${block.id}` }
+      }
+      if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+        return { ...block, tool_use_id: `${namespace}/${block.tool_use_id}` }
+      }
+      return block
+    })
+  }
+
+  private subagentTranscriptPath(
+    projectDir: string,
+    sessionId: string,
+    agentId: string,
+  ): string {
+    const normalizedAgentId = agentId.startsWith('agent-') ? agentId : `agent-${agentId}`
+    return path.join(
+      this.getProjectsDir(),
+      projectDir,
+      sessionId,
+      'subagents',
+      `${normalizedAgentId}.jsonl`,
+    )
+  }
+
+  private async loadSubagentToolMessages(
+    projectDir: string,
+    sessionId: string,
+    parentToolUseId: string,
+    agentId: string,
+  ): Promise<MessageEntry[]> {
+    const filePath = this.subagentTranscriptPath(projectDir, sessionId, agentId)
+    const entries = await this.readJsonlFile(filePath)
+    const namespace = `${parentToolUseId}/${agentId}`
+    const messages: MessageEntry[] = []
+
+    for (const entry of entries) {
+      if (!entry.message?.role || entry.isMeta) continue
+      if (this.shouldHideTranscriptEntry(entry)) continue
+      if (entry.type !== 'user' && entry.type !== 'assistant' && entry.type !== 'system') {
+        continue
+      }
+
+      const message = this.entryToMessage(
+        {
+          ...entry,
+          message: {
+            ...entry.message,
+            content: this.namespaceSubagentContentIds(entry.message.content, namespace),
+          },
+        },
+        parentToolUseId,
+      )
+      if (message && (message.type === 'tool_use' || message.type === 'tool_result')) {
+        messages.push(message)
+      }
+    }
+
+    return messages
+  }
+
+  private async appendSubagentToolMessages(
+    projectDir: string,
+    sessionId: string,
+    messages: MessageEntry[],
+  ): Promise<MessageEntry[]> {
+    const resultLinks = this.extractAgentResultLinks(messages)
+    if (resultLinks.size === 0) {
+      return messages
+    }
+
+    const childMessages = await Promise.all(
+      [...resultLinks.entries()].map(([parentToolUseId, agentId]) =>
+        this.loadSubagentToolMessages(projectDir, sessionId, parentToolUseId, agentId),
+      ),
+    )
+    return [...messages, ...childMessages.flat()]
   }
 
   private resolveParentToolUseId(
@@ -373,7 +735,8 @@ export class SessionService {
     for (let i = entries.length - 1; i >= 0; i--) {
       const e = entries[i]!
       if (e.type === 'ai-title' && e.aiTitle) {
-        return e.aiTitle as string
+        const title = cleanSessionTitleSource(String(e.aiTitle))
+        if (title) return title
       }
     }
 
@@ -391,7 +754,8 @@ export class SessionService {
           if (textBlock) text = textBlock.text as string
         }
         if (text) {
-          return text.length > 80 ? text.slice(0, 80) + '...' : text
+          const title = cleanSessionTitleSource(text)
+          if (title) return title.length > 80 ? title.slice(0, 80) + '...' : title
         }
       }
     }
@@ -475,12 +839,11 @@ export class SessionService {
    * Find the .jsonl file for a given session ID.
    * Searches across all project directories since sessions may belong to any project.
    */
-  async findSessionFile(
+  private async findSessionFiles(
     sessionId: string
-  ): Promise<{ filePath: string; projectDir: string } | null> {
-    // Validate sessionId format to prevent path traversal
+  ): Promise<Array<{ filePath: string; projectDir: string }>> {
     if (!this.isValidSessionId(sessionId)) {
-      return null
+      return []
     }
 
     const projectsDir = this.getProjectsDir()
@@ -489,25 +852,284 @@ export class SessionService {
     try {
       projectDirs = await fs.readdir(projectsDir)
     } catch {
-      return null
+      return []
     }
 
+    const matches: Array<{ filePath: string; projectDir: string; mtimeMs: number }> = []
     for (const dir of projectDirs) {
       const filePath = path.join(projectsDir, dir, `${sessionId}.jsonl`)
       try {
-        await fs.access(filePath)
-        return { filePath, projectDir: dir }
+        const stat = await fs.stat(filePath)
+        matches.push({ filePath, projectDir: dir, mtimeMs: stat.mtimeMs })
       } catch {
         continue
       }
     }
 
-    return null
+    return matches
+      .sort((a, b) => b.mtimeMs - a.mtimeMs)
+      .map(({ filePath, projectDir }) => ({ filePath, projectDir }))
+  }
+
+  async findSessionFile(
+    sessionId: string
+  ): Promise<{ filePath: string; projectDir: string } | null> {
+    return (await this.findSessionFiles(sessionId))[0] ?? null
   }
 
   private isValidSessionId(id: string): boolean {
     // UUID v4 format
     return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)
+  }
+
+  private formatCost(cost: number): string {
+    return `$${cost > 0.5 ? (Math.round(cost * 100) / 100).toFixed(2) : cost.toFixed(4)}`
+  }
+
+  private getTranscriptContextWindow(model: string): number {
+    try {
+      return getContextWindowForModel(model)
+    } catch (err) {
+      if (
+        err instanceof Error &&
+        err.message.includes('Config accessed before allowed')
+      ) {
+        return MODEL_CONTEXT_WINDOW_DEFAULT
+      }
+      throw err
+    }
+  }
+
+  async getTranscriptMetadata(sessionId: string): Promise<TranscriptMetadataSnapshot | null> {
+    const found = await this.findSessionFile(sessionId)
+    if (!found) return null
+
+    const entries = await this.readJsonlFile(found.filePath)
+    const metadata: TranscriptMetadataSnapshot = {}
+
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const entry = entries[i]!
+      if (!metadata.model && typeof entry.message?.model === 'string') {
+        metadata.model = entry.message.model
+      }
+      if (!metadata.cwd && typeof entry.cwd === 'string') {
+        metadata.cwd = entry.cwd
+      }
+      if (!metadata.version && typeof entry.version === 'string') {
+        metadata.version = entry.version
+      }
+      if (metadata.model && metadata.cwd && metadata.version) break
+    }
+
+    return metadata
+  }
+
+  async getTranscriptContextEstimate(sessionId: string): Promise<TranscriptContextEstimate | null> {
+    const found = await this.findSessionFile(sessionId)
+    if (!found) return null
+
+    const entries = await this.readJsonlFile(found.filePath)
+    let latest: {
+      model: string
+      inputTokens: number
+      outputTokens: number
+      cacheReadInputTokens: number
+      cacheCreationInputTokens: number
+    } | null = null
+
+    for (const entry of entries) {
+      const usage = entry.message?.usage
+      const model = entry.message?.model
+      if (!usage || typeof model !== 'string') continue
+
+      const inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0
+      const outputTokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : 0
+      const cacheReadInputTokens = typeof usage.cache_read_input_tokens === 'number' ? usage.cache_read_input_tokens : 0
+      const cacheCreationInputTokens = typeof usage.cache_creation_input_tokens === 'number' ? usage.cache_creation_input_tokens : 0
+      const promptTokens = inputTokens + cacheReadInputTokens + cacheCreationInputTokens
+      if (promptTokens === 0 && outputTokens === 0) continue
+
+      latest = {
+        model,
+        inputTokens,
+        outputTokens,
+        cacheReadInputTokens,
+        cacheCreationInputTokens,
+      }
+    }
+
+    if (!latest) return null
+
+    const rawMaxTokens = this.getTranscriptContextWindow(latest.model)
+    const promptTokens = latest.inputTokens + latest.cacheReadInputTokens + latest.cacheCreationInputTokens
+    const totalTokens = calculateCurrentContextTokenTotal(promptTokens, {
+      input_tokens: latest.inputTokens,
+      output_tokens: latest.outputTokens,
+      cache_read_input_tokens: latest.cacheReadInputTokens,
+      cache_creation_input_tokens: latest.cacheCreationInputTokens,
+    }, rawMaxTokens)
+    const percentage = rawMaxTokens > 0 ? Math.round((totalTokens / rawMaxTokens) * 100) : 0
+    const categories: TranscriptContextEstimate['categories'] = [
+      { name: 'Input tokens', tokens: latest.inputTokens, color: '#8f3217' },
+      { name: 'Cache read', tokens: latest.cacheReadInputTokens, color: '#0f5c8f' },
+      { name: 'Cache write', tokens: latest.cacheCreationInputTokens, color: '#7c3aed' },
+      { name: 'Output tokens', tokens: latest.outputTokens, color: '#2f7d32' },
+      { name: 'Free space', tokens: Math.max(0, rawMaxTokens - totalTokens), color: '#a1a1aa', isDeferred: true },
+    ].filter((category) => category.tokens > 0)
+
+    const filledSquares = Math.max(0, Math.min(100, Math.round((totalTokens / Math.max(1, rawMaxTokens)) * 100)))
+    const gridRows = Array.from({ length: 10 }, (_, row) =>
+      Array.from({ length: 10 }, (_, col) => {
+        const index = row * 10 + col
+        const isFilled = index < filledSquares
+        return {
+          color: isFilled ? '#8f3217' : '#a1a1aa',
+          isFilled,
+          categoryName: isFilled ? 'Input context' : 'Free space',
+          tokens: Math.round(rawMaxTokens / 100),
+          percentage: 1,
+          squareFullness: isFilled ? 1 : 0,
+        }
+      }),
+    )
+
+    return {
+      categories,
+      totalTokens,
+      maxTokens: rawMaxTokens,
+      rawMaxTokens,
+      percentage,
+      gridRows,
+      model: latest.model,
+      memoryFiles: [],
+      mcpTools: [],
+      agents: [],
+      apiUsage: {
+        input_tokens: latest.inputTokens,
+        output_tokens: latest.outputTokens,
+        cache_creation_input_tokens: latest.cacheCreationInputTokens,
+        cache_read_input_tokens: latest.cacheReadInputTokens,
+      },
+    }
+  }
+
+  async getTranscriptUsage(sessionId: string): Promise<TranscriptUsageSnapshot | null> {
+    const found = await this.findSessionFile(sessionId)
+    if (!found) return null
+
+    const entries = await this.readJsonlFile(found.filePath)
+    const models = new Map<string, TranscriptUsageSnapshot['models'][number]>()
+    let totalCostUSD = 0
+    let totalInputTokens = 0
+    let totalOutputTokens = 0
+    let totalCacheReadInputTokens = 0
+    let totalCacheCreationInputTokens = 0
+    let totalWebSearchRequests = 0
+    let hasUnknownModelCost = false
+    let firstUsageAt: number | null = null
+    let lastUsageAt: number | null = null
+
+    for (const entry of entries) {
+      const usage = entry.message?.usage
+      const model = entry.message?.model
+      if (!usage || typeof model !== 'string') continue
+
+      const inputTokens = typeof usage.input_tokens === 'number' ? usage.input_tokens : 0
+      const outputTokens = typeof usage.output_tokens === 'number' ? usage.output_tokens : 0
+      const cacheReadInputTokens = typeof usage.cache_read_input_tokens === 'number' ? usage.cache_read_input_tokens : 0
+      const cacheCreationInputTokens = typeof usage.cache_creation_input_tokens === 'number' ? usage.cache_creation_input_tokens : 0
+      const webSearchRequests = typeof usage.server_tool_use?.web_search_requests === 'number'
+        ? usage.server_tool_use.web_search_requests
+        : 0
+
+      if (
+        inputTokens === 0 &&
+        outputTokens === 0 &&
+        cacheReadInputTokens === 0 &&
+        cacheCreationInputTokens === 0 &&
+        webSearchRequests === 0
+      ) {
+        continue
+      }
+
+      const canonical = getCanonicalName(model)
+      if (!Object.prototype.hasOwnProperty.call(MODEL_COSTS, canonical)) {
+        hasUnknownModelCost = true
+      }
+
+      const costUsage = {
+        input_tokens: inputTokens,
+        output_tokens: outputTokens,
+        cache_read_input_tokens: cacheReadInputTokens,
+        cache_creation_input_tokens: cacheCreationInputTokens,
+        server_tool_use: { web_search_requests: webSearchRequests },
+        speed: usage.speed,
+      } as Parameters<typeof calculateUSDCost>[1]
+      const costUSD = calculateUSDCost(model, costUsage)
+
+      let modelUsage = models.get(model)
+      if (!modelUsage) {
+        modelUsage = {
+          model,
+          displayName: canonical,
+          inputTokens: 0,
+          outputTokens: 0,
+          cacheReadInputTokens: 0,
+          cacheCreationInputTokens: 0,
+          webSearchRequests: 0,
+          costUSD: 0,
+          costDisplay: '$0.0000',
+          contextWindow: this.getTranscriptContextWindow(model),
+          maxOutputTokens: getModelMaxOutputTokens(model).default,
+        }
+        models.set(model, modelUsage)
+      }
+
+      modelUsage.inputTokens += inputTokens
+      modelUsage.outputTokens += outputTokens
+      modelUsage.cacheReadInputTokens += cacheReadInputTokens
+      modelUsage.cacheCreationInputTokens += cacheCreationInputTokens
+      modelUsage.webSearchRequests += webSearchRequests
+      modelUsage.costUSD += costUSD
+      modelUsage.costDisplay = this.formatCost(modelUsage.costUSD)
+
+      totalCostUSD += costUSD
+      totalInputTokens += inputTokens
+      totalOutputTokens += outputTokens
+      totalCacheReadInputTokens += cacheReadInputTokens
+      totalCacheCreationInputTokens += cacheCreationInputTokens
+      totalWebSearchRequests += webSearchRequests
+
+      if (entry.timestamp) {
+        const time = Date.parse(entry.timestamp)
+        if (!Number.isNaN(time)) {
+          firstUsageAt = firstUsageAt === null ? time : Math.min(firstUsageAt, time)
+          lastUsageAt = lastUsageAt === null ? time : Math.max(lastUsageAt, time)
+        }
+      }
+    }
+
+    if (models.size === 0) return null
+
+    return {
+      source: 'transcript',
+      totalCostUSD,
+      costDisplay: this.formatCost(totalCostUSD),
+      hasUnknownModelCost,
+      totalAPIDuration: 0,
+      totalDuration:
+        firstUsageAt !== null && lastUsageAt !== null
+          ? Math.max(0, Math.round((lastUsageAt - firstUsageAt) / 1000))
+          : 0,
+      totalLinesAdded: 0,
+      totalLinesRemoved: 0,
+      totalInputTokens,
+      totalOutputTokens,
+      totalCacheReadInputTokens,
+      totalCacheCreationInputTokens,
+      totalWebSearchRequests,
+      models: Array.from(models.values()),
+    }
   }
 
   // --------------------------------------------------------------------------
@@ -523,13 +1145,27 @@ export class SessionService {
     offset?: number
   }): Promise<{ sessions: SessionListItem[]; total: number }> {
     const sessionFiles = await this.discoverSessionFiles(options?.project)
+    const filesWithStats = (await Promise.all(sessionFiles.map(async (sessionFile) => {
+      try {
+        return {
+          ...sessionFile,
+          stat: await fs.stat(sessionFile.filePath),
+        }
+      } catch {
+        return null
+      }
+    }))).filter((item): item is NonNullable<typeof item> => item !== null)
+
+    filesWithStats.sort((a, b) => b.stat.mtime.getTime() - a.stat.mtime.getTime())
+
+    const total = filesWithStats.length
+    const offset = options?.offset ?? 0
+    const limit = options?.limit ?? 50
+    const paginatedFiles = filesWithStats.slice(offset, offset + limit)
 
     // Build session list items with metadata from file stats & first entries
-    const items: SessionListItem[] = []
-
-    for (const { filePath, projectDir, sessionId } of sessionFiles) {
+    const items = (await Promise.all(paginatedFiles.map(async ({ filePath, projectDir, sessionId, stat }) => {
       try {
-        const stat = await fs.stat(filePath)
         const entries = await this.readJsonlFile(filePath)
         const workDir = this.resolveWorkDirFromEntries(entries, projectDir)
         const workDirExists = await this.pathExists(workDir)
@@ -550,7 +1186,7 @@ export class SessionService {
           }
         }
 
-        items.push({
+        return {
           id: sessionId,
           title,
           createdAt,
@@ -559,21 +1195,14 @@ export class SessionService {
           projectPath: projectDir,
           workDir,
           workDirExists,
-        })
+        }
       } catch {
         // Skip unreadable files
+        return null
       }
-    }
+    }))).filter((item): item is SessionListItem => item !== null)
 
-    // Sort by modifiedAt descending (most recent first)
-    items.sort((a, b) => new Date(b.modifiedAt).getTime() - new Date(a.modifiedAt).getTime())
-
-    const total = items.length
-    const offset = options?.offset ?? 0
-    const limit = options?.limit ?? 50
-    const paginated = items.slice(offset, offset + limit)
-
-    return { sessions: paginated, total }
+    return { sessions: items, total }
   }
 
   /**
@@ -587,7 +1216,11 @@ export class SessionService {
     const stat = await fs.stat(filePath)
     const entries = await this.readJsonlFile(filePath)
 
-    const messages = this.entriesToMessages(entries)
+    const messages = await this.appendSubagentToolMessages(
+      projectDir,
+      sessionId,
+      this.entriesToMessages(entries),
+    )
     const title = this.extractTitle(entries)
     const workDir = this.resolveWorkDirFromEntries(entries, projectDir)
     const workDirExists = await this.pathExists(workDir)
@@ -623,37 +1256,42 @@ export class SessionService {
     }
 
     const entries = await this.readJsonlFile(found.filePath)
-    return this.entriesToMessages(entries)
+    return await this.appendSubagentToolMessages(
+      found.projectDir,
+      sessionId,
+      this.entriesToMessages(entries),
+    )
   }
 
   /**
    * Create a new session file for the given working directory.
    */
-  async createSession(workDir?: string): Promise<{ sessionId: string }> {
+  async createSession(
+    workDir?: string,
+    repositoryOptions?: CreateSessionRepositoryOptions,
+  ): Promise<{ sessionId: string; workDir: string }> {
     // Default to user home directory when no workDir specified
     const resolvedWorkDir = workDir || os.homedir()
+    const sessionId = crypto.randomUUID()
 
     // Resolve to absolute path. NOTE: path.resolve() uses process.cwd() to
     // expand relative paths — in bundled sidecar mode the server's cwd is
     // typically '/'. Callers (IM adapters) already send absolute realPath,
     // but we log here so cwd regressions are caught early.
-    const absWorkDir = path.resolve(resolvedWorkDir)
+    const preparedWorkspace = await resolveSessionWorkspaceLaunch(
+      resolvedWorkDir,
+      repositoryOptions,
+      sessionId,
+    )
+    const absWorkDir = preparedWorkspace.workDir
     console.log(
       `[SessionService] createSession: requested workDir=${JSON.stringify(
         workDir,
-      )}, resolved=${absWorkDir} (process.cwd()=${process.cwd()})`,
+      )}, resolved=${absWorkDir}, repository=${JSON.stringify(
+        preparedWorkspace.repository ?? null,
+      )} (process.cwd()=${process.cwd()})`,
     )
-    let stat
-    try {
-      stat = await fs.stat(absWorkDir)
-    } catch {
-      throw ApiError.badRequest(`Working directory does not exist: ${absWorkDir}`)
-    }
-    if (!stat.isDirectory()) {
-      throw ApiError.badRequest(`Working directory is not a directory: ${absWorkDir}`)
-    }
 
-    const sessionId = crypto.randomUUID()
     const sanitized = this.sanitizePath(absWorkDir)
     const dirPath = path.join(this.getProjectsDir(), sanitized)
 
@@ -680,12 +1318,13 @@ export class SessionService {
       type: 'session-meta',
       isMeta: true,
       workDir: absWorkDir,
+      repository: preparedWorkspace.repository,
       timestamp: now,
     }
 
     await fs.writeFile(filePath, JSON.stringify(initialEntry) + '\n' + JSON.stringify(metaEntry) + '\n', 'utf-8')
 
-    return { sessionId }
+    return { sessionId, workDir: absWorkDir }
   }
 
   /**
@@ -736,6 +1375,20 @@ export class SessionService {
     })
   }
 
+  async getCustomTitle(sessionId: string): Promise<string | null> {
+    const found = await this.findSessionFile(sessionId)
+    if (!found) return null
+
+    const entries = await this.readJsonlFile(found.filePath)
+    let customTitle: string | null = null
+    for (const entry of entries) {
+      if (entry.type === 'custom-title' && typeof entry.customTitle === 'string' && entry.customTitle.trim()) {
+        customTitle = entry.customTitle
+      }
+    }
+    return customTitle
+  }
+
   /**
    * Get the actual working directory for a session.
    * First checks for stored session-meta entry, then falls back to desanitizePath.
@@ -748,6 +1401,18 @@ export class SessionService {
     return this.resolveWorkDirFromEntries(entries, found.projectDir)
   }
 
+  async getSessionMessageCwd(
+    sessionId: string,
+    messageId: string,
+  ): Promise<string | null> {
+    const found = await this.findSessionFile(sessionId)
+    if (!found) return null
+
+    const entries = await this.readJsonlFile(found.filePath)
+    const entry = entries.find((candidate) => candidate.uuid === messageId)
+    return typeof entry?.cwd === 'string' && entry.cwd.trim() ? entry.cwd : null
+  }
+
   /**
    * Inspect how a session should be launched.
    * Placeholder desktop-created sessions have zero transcript messages.
@@ -758,26 +1423,23 @@ export class SessionService {
 
     const entries = await this.readJsonlFile(found.filePath)
     const workDir = this.resolveWorkDirFromEntries(entries, found.projectDir) || process.cwd()
+    const repository = this.resolveRepositoryFromEntries(entries)
+    const worktreeSession = this.resolveWorktreeSessionFromEntries(entries)
     let customTitle: string | null = null
-    let transcriptMessageCount = 0
 
     for (const entry of entries) {
       if (entry.type === 'custom-title' && typeof entry.customTitle === 'string') {
         customTitle = entry.customTitle
       }
-      if (
-        !entry.isMeta &&
-        entry.message?.role &&
-        (entry.type === 'user' || entry.type === 'assistant' || entry.type === 'system')
-      ) {
-        transcriptMessageCount++
-      }
     }
+    const transcriptMessageCount = this.countTranscriptMessages(entries)
 
     return {
       filePath: found.filePath,
       projectDir: found.projectDir,
       workDir,
+      repository,
+      worktreeSession,
       transcriptMessageCount,
       customTitle,
     }
@@ -789,27 +1451,126 @@ export class SessionService {
     await fs.unlink(found.filePath)
   }
 
+  async clearSessionTranscript(sessionId: string, fallbackWorkDir?: string): Promise<void> {
+    let found = await this.findSessionFile(sessionId)
+    if (!found && fallbackWorkDir) {
+      const resolvedPath = path.resolve(fallbackWorkDir)
+      const absWorkDir = await fs.realpath(resolvedPath).catch(() => resolvedPath)
+      const dirPath = path.join(this.getProjectsDir(), this.sanitizePath(absWorkDir))
+      await fs.mkdir(dirPath, { recursive: true })
+      found = {
+        filePath: path.join(dirPath, `${sessionId}.jsonl`),
+        projectDir: this.sanitizePath(absWorkDir),
+      }
+    }
+    if (!found) {
+      throw ApiError.notFound(`Session not found: ${sessionId}`)
+    }
+
+    const entries = await this.readJsonlFile(found.filePath)
+    const workDir = this.resolveWorkDirFromEntries(entries, found.projectDir) || fallbackWorkDir || process.cwd()
+    const repository = this.resolveRepositoryFromEntries(entries)
+    const now = new Date().toISOString()
+
+    const initialEntry = {
+      type: 'file-history-snapshot',
+      messageId: crypto.randomUUID(),
+      snapshot: {
+        messageId: crypto.randomUUID(),
+        trackedFileBackups: {},
+        timestamp: now,
+      },
+      isSnapshotUpdate: false,
+    }
+
+    const metaEntry = {
+      type: 'session-meta',
+      isMeta: true,
+      workDir,
+      repository,
+      timestamp: now,
+    }
+
+    await fs.writeFile(
+      found.filePath,
+      `${JSON.stringify(initialEntry)}\n${JSON.stringify(metaEntry)}\n`,
+      'utf-8',
+    )
+  }
+
   async appendSessionMetadata(
     sessionId: string,
-    metadata: { workDir: string; customTitle?: string | null }
+    metadata: {
+      workDir: string
+      customTitle?: string | null
+      repository?: PreparedSessionWorkspace['repository']
+    }
   ): Promise<void> {
-    const found = await this.findSessionFile(sessionId)
-    if (!found) return
+    const matches = await this.findSessionFiles(sessionId)
+    if (matches.length === 0) return
 
-    await this.appendJsonlEntry(found.filePath, {
+    let repository = metadata.repository
+    if (!repository) {
+      for (const match of matches) {
+        const candidate = this.resolveRepositoryFromEntries(await this.readJsonlFile(match.filePath))
+        if (candidate) {
+          repository = candidate
+          break
+        }
+      }
+    }
+
+    const targetProjectDir = this.sanitizePath(metadata.workDir)
+    const targetFilePath = path.join(this.getProjectsDir(), targetProjectDir, `${sessionId}.jsonl`)
+    await fs.mkdir(path.dirname(targetFilePath), { recursive: true })
+
+    await this.appendJsonlEntry(targetFilePath, {
       type: 'session-meta',
       isMeta: true,
       workDir: metadata.workDir,
+      repository,
       timestamp: new Date().toISOString(),
     })
 
     if (metadata.customTitle) {
-      await this.appendJsonlEntry(found.filePath, {
+      await this.appendJsonlEntry(targetFilePath, {
         type: 'custom-title',
         customTitle: metadata.customTitle,
         timestamp: new Date().toISOString(),
       })
     }
+  }
+
+  async deletePlaceholderSessionFiles(
+    sessionId: string,
+    keepWorkDir: string,
+  ): Promise<number> {
+    if (!this.isValidSessionId(sessionId)) return 0
+
+    const projectsDir = this.getProjectsDir()
+    let projectDirs: import('node:fs').Dirent[]
+    try {
+      projectDirs = await fs.readdir(projectsDir, { withFileTypes: true })
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return 0
+      throw err
+    }
+
+    const keepProjectDir = this.sanitizePath(keepWorkDir)
+    let removed = 0
+    for (const projectDir of projectDirs) {
+      if (!projectDir.isDirectory()) continue
+      if (projectDir.name === keepProjectDir) continue
+      const filePath = path.join(projectsDir, projectDir.name, `${sessionId}.jsonl`)
+      const entries = await this.readJsonlFile(filePath)
+      if (entries.length === 0) continue
+
+      if (this.countTranscriptMessages(entries) > 0) continue
+
+      await fs.rm(filePath, { force: true })
+      removed += 1
+    }
+    return removed
   }
 
   async trimSessionMessagesFrom(
@@ -832,6 +1593,11 @@ export class SessionService {
     const removedMessageIds = activeMessages
       .slice(startIndex)
       .map((message) => message.id)
+    const remainingMessageIds = new Set(
+      activeMessages
+        .slice(0, startIndex)
+        .map((message) => message.id),
+    )
 
     if (removedMessageIds.length === 0) {
       return { removedCount: 0, removedMessageIds: [] }
@@ -839,7 +1605,17 @@ export class SessionService {
 
     const removedIds = new Set(removedMessageIds)
     const filteredEntries = entries.filter(
-      (entry) => !(typeof entry.uuid === 'string' && removedIds.has(entry.uuid)),
+      (entry) => {
+        if (typeof entry.uuid !== 'string') return true
+        if (removedIds.has(entry.uuid)) return false
+        if (
+          entry.message?.role &&
+          (entry.type === 'user' || entry.type === 'assistant' || entry.type === 'system')
+        ) {
+          return remainingMessageIds.has(entry.uuid)
+        }
+        return true
+      },
     )
 
     const content =
@@ -893,6 +1669,24 @@ export class SessionService {
     return [...snapshotsByMessageId.values()]
   }
 
+  async getSessionTaskNotifications(
+    sessionId: string,
+  ): Promise<SessionTaskNotification[]> {
+    const found = await this.findSessionFile(sessionId)
+    if (!found) {
+      throw ApiError.notFound(`Session not found: ${sessionId}`)
+    }
+
+    const entries = await this.readJsonlFile(found.filePath)
+    const notifications: SessionTaskNotification[] = []
+    for (const entry of entries) {
+      if (entry.message?.role !== 'user') continue
+      const notification = this.parseTaskNotificationContent(entry.message.content)
+      if (notification) notifications.push(notification)
+    }
+    return notifications
+  }
+
   // --------------------------------------------------------------------------
   // Private helpers
   // --------------------------------------------------------------------------
@@ -901,6 +1695,7 @@ export class SessionService {
     const messages: MessageEntry[] = []
     const entriesByUuid = new Map<string, RawEntry>()
     const parentToolUseIdCache = new Map<string, string | undefined>()
+    let suppressTaskNotificationResponse = false
 
     for (const entry of entries) {
       if (typeof entry.uuid === 'string' && entry.uuid.length > 0) {
@@ -914,6 +1709,23 @@ export class SessionService {
 
       // Skip meta entries (CLI internal bookkeeping)
       if (entry.isMeta) continue
+
+      const isTaskNotification =
+        entry.message.role === 'user' &&
+        this.isTaskNotificationContent(entry.message.content)
+      if (isTaskNotification) {
+        suppressTaskNotificationResponse = true
+        continue
+      }
+
+      if (
+        entry.message.role === 'user' &&
+        !this.isToolResultContent(entry.message.content)
+      ) {
+        suppressTaskNotificationResponse = false
+      } else if (suppressTaskNotificationResponse) {
+        continue
+      }
 
       if (this.shouldHideTranscriptEntry(entry)) continue
 

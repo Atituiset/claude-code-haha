@@ -11,13 +11,20 @@ import { WsBridge, type ServerMessage } from '../common/ws-bridge.js'
 import { MessageBuffer } from '../common/message-buffer.js'
 import { MessageDedup } from '../common/message-dedup.js'
 import { enqueue } from '../common/chat-queue.js'
-import { loadConfig } from '../common/config.js'
+import { getConfiguredWorkDir, loadConfig } from '../common/config.js'
 import {
   formatImHelp,
   formatImStatus,
   formatPermissionRequest,
   splitMessage,
 } from '../common/format.js'
+import {
+  formatPermissionDecisionStatus,
+  formatPermissionInstructions,
+  parsePermissionCommand,
+  parsePermitCallbackData,
+  type PermissionDecision,
+} from '../common/permission.js'
 import { SessionStore } from '../common/session-store.js'
 import { AdapterHttpClient } from '../common/http-client.js'
 import { isAllowedUser, tryPair } from '../common/pairing.js'
@@ -43,7 +50,8 @@ const bot = new Bot(config.telegram.botToken)
 const bridge = new WsBridge(config.serverUrl, 'tg')
 const dedup = new MessageDedup()
 const sessionStore = new SessionStore()
-const httpClient = new AdapterHttpClient(config.serverUrl)
+const defaultWorkDir = getConfiguredWorkDir(config, config.telegram)
+const httpClient = new AdapterHttpClient(config.serverUrl, { allowedProjectRoots: [defaultWorkDir] })
 const attachmentStore = new AttachmentStore()
 const media = new TelegramMediaService(bot, attachmentStore)
 attachmentStore.gc().catch((err) => {
@@ -59,6 +67,7 @@ const buffers = new Map<string, MessageBuffer>()
 // Track chats waiting for project selection
 const pendingProjectSelection = new Map<string, boolean>()
 const runtimeStates = new Map<string, ChatRuntimeState>()
+const pendingPermissions = new Map<string, Set<string>>()
 /** Per-chat outbound image watcher for Agent-produced markdown images. */
 const tgImageWatchers = new Map<string, ImageBlockWatcher>()
 
@@ -108,7 +117,27 @@ function clearTransientChatState(chatId: string): void {
   runtime.state = 'idle'
   runtime.verb = undefined
   runtime.pendingPermissionCount = 0
+  pendingPermissions.delete(chatId)
   tgImageWatchers.delete(chatId)
+}
+
+async function handlePermissionDecision(chatId: string, decision: PermissionDecision): Promise<void> {
+  const pending = pendingPermissions.get(chatId)
+  if (!pending?.has(decision.requestId)) {
+    await bot.api.sendMessage(Number(chatId), `未找到待确认的权限请求：${decision.requestId}`)
+    return
+  }
+
+  const sent = bridge.sendPermissionResponse(chatId, decision.requestId, decision.allowed, decision.rule)
+  if (sent) {
+    pending.delete(decision.requestId)
+    const runtime = getRuntimeState(chatId)
+    runtime.pendingPermissionCount = Math.max(0, runtime.pendingPermissionCount - 1)
+  }
+  await bot.api.sendMessage(
+    Number(chatId),
+    sent ? `${formatPermissionDecisionStatus(decision)}。` : '权限响应发送失败，请检查会话状态。',
+  )
 }
 
 async function ensureExistingSession(chatId: string): Promise<{ sessionId: string; workDir: string } | null> {
@@ -225,7 +254,7 @@ async function ensureSession(chatId: string): Promise<boolean> {
     return await bridge.waitForOpen(chatId)
   }
 
-  const workDir = config.defaultProjectDir
+  const workDir = defaultWorkDir
   if (workDir) {
     return await createSessionForChat(chatId, workDir)
   }
@@ -265,7 +294,7 @@ async function showProjectPicker(chatId: string): Promise<void> {
     const projects = await httpClient.listRecentProjects()
     if (projects.length === 0) {
       await bot.api.sendMessage(numericChatId,
-        '没有找到最近的项目。请先在 Desktop App 中打开一个项目，或在 Settings → IM 接入中配置默认项目。')
+        `没有找到最近的项目。发送 /new 会使用默认工作目录：${defaultWorkDir}\n也可以发送 /new /path/to/project 指定项目。`)
       return
     }
 
@@ -274,7 +303,7 @@ async function showProjectPicker(chatId: string): Promise<void> {
     )
     pendingProjectSelection.set(chatId, true)
     await bot.api.sendMessage(numericChatId,
-      `选择项目（回复编号）：\n\n${lines.join('\n\n')}\n\n💡 下次可直接 /new <编号或名称> 快速新建会话`)
+      `选择项目（回复编号）：\n\n${lines.join('\n\n')}\n\n💡 下次可直接 /new <编号、名称或绝对路径> 快速新建会话`)
   } catch (err) {
     await bot.api.sendMessage(numericChatId,
       `❌ 无法获取项目列表: ${err instanceof Error ? err.message : String(err)}`)
@@ -407,9 +436,14 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
     case 'permission_request': {
       runtime.pendingPermissionCount += 1
       runtime.state = 'permission_pending'
-      const text = formatPermissionRequest(msg.toolName, msg.input, msg.requestId)
+      const pending = pendingPermissions.get(chatId) ?? new Set<string>()
+      pending.add(msg.requestId)
+      pendingPermissions.set(chatId, pending)
+      const text = `${formatPermissionRequest(msg.toolName, msg.input, msg.requestId)}\n\n${formatPermissionInstructions(msg.requestId)}`
       const keyboard = new InlineKeyboard()
         .text('✅ 允许', `permit:${msg.requestId}:yes`)
+        .text('♾️ 永久允许', `permit:${msg.requestId}:always`)
+        .row()
         .text('❌ 拒绝', `permit:${msg.requestId}:no`)
       await bot.api.sendMessage(numericChatId, text, { reply_markup: keyboard })
       break
@@ -444,7 +478,7 @@ async function handleServerMessage(chatId: string, msg: ServerMessage): Promise<
       // This happens when the API key or provider changed since the session was created.
       if (msg.message && /Invalid.*signature.*thinking/i.test(msg.message)) {
         const stored = sessionStore.get(chatId)
-        const workDir = stored?.workDir || config.defaultProjectDir
+        const workDir = stored?.workDir || defaultWorkDir
         if (workDir) {
           await bot.api.sendMessage(numericChatId, '⚠️ 会话上下文已失效，正在自动重建...')
           clearTransientChatState(chatId)
@@ -486,7 +520,7 @@ bot.command('help', (ctx) => void sendHelp(ctx))
 
 /** Reset session state and start a new session for chatId.
  *  If `query` is provided, match a project by index or name;
- *  otherwise use defaultProjectDir or show the picker. */
+ *  otherwise use the configured/default work directory. */
 async function startNewSession(chatId: string, query?: string): Promise<void> {
   const numericChatId = Number(chatId)
 
@@ -497,6 +531,7 @@ async function startNewSession(chatId: string, query?: string): Promise<void> {
   buffers.get(chatId)?.reset()
   buffers.delete(chatId)
   pendingProjectSelection.delete(chatId)
+  pendingPermissions.delete(chatId)
   runtimeStates.delete(chatId)
   tgImageWatchers.delete(chatId)
 
@@ -522,7 +557,7 @@ async function startNewSession(chatId: string, query?: string): Promise<void> {
         `❌ ${err instanceof Error ? err.message : String(err)}`)
     }
   } else {
-    const workDir = config.defaultProjectDir
+    const workDir = defaultWorkDir
     if (workDir) {
       const ok = await createSessionForChat(chatId, workDir)
       if (ok) {
@@ -580,6 +615,12 @@ bot.command('clear', (ctx) => {
   })()
 })
 
+for (const command of ['allow', 'always', 'allow-always', 'deny'] as const) {
+  bot.command(command, async (ctx) => {
+    await routeUserMessage(ctx, `/${command}${ctx.match ? ` ${ctx.match}` : ''}`, [])
+  })
+}
+
 /** Shared per-user-message pipeline: dedup, pairing check, project-pick
  *  routing, enqueue, ensureSession, sendUserMessage with attachments.
  *  Caller has already extracted text and attachments from the context. */
@@ -606,6 +647,14 @@ async function routeUserMessage(
   }
 
   enqueue(chatId, async () => {
+    const permissionDecision = attachments.length === 0
+      ? parsePermissionCommand(text, pendingPermissions.get(chatId))
+      : null
+    if (permissionDecision) {
+      await handlePermissionDecision(chatId, permissionDecision)
+      return
+    }
+
     if (pendingProjectSelection.has(chatId)) {
       if (text.trim()) await startNewSession(chatId, text.trim())
       return
@@ -713,18 +762,16 @@ bot.on('callback_query:data', async (ctx) => {
   const data = ctx.callbackQuery.data
   if (!data.startsWith('permit:')) return
 
-  const parts = data.split(':')
-  if (parts.length !== 3) return
-
-  const requestId = parts[1]!
-  const allowed = parts[2] === 'yes'
+  const decision = parsePermitCallbackData(data)
+  if (!decision) return
   const chatId = String(ctx.callbackQuery.message?.chat.id)
 
-  bridge.sendPermissionResponse(chatId, requestId, allowed)
+  bridge.sendPermissionResponse(chatId, decision.requestId, decision.allowed, decision.rule)
   const runtime = getRuntimeState(chatId)
   runtime.pendingPermissionCount = Math.max(0, runtime.pendingPermissionCount - 1)
+  pendingPermissions.get(chatId)?.delete(decision.requestId)
 
-  const statusText = allowed ? '✅ 已允许' : '❌ 已拒绝'
+  const statusText = formatPermissionDecisionStatus(decision)
   try {
     await ctx.editMessageText(
       ctx.callbackQuery.message?.text + `\n\n${statusText}`,

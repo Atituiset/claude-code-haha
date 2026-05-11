@@ -8,6 +8,8 @@ type Props = {
 }
 
 export function AssistantMessage({ content, isStreaming }: Props) {
+  if (!content.trim()) return null
+
   const documentLayout = shouldUseDocumentLayout(content)
 
   return (

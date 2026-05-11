@@ -5,8 +5,13 @@ export type AttachmentPreview = {
   id?: string
   type: 'image' | 'file'
   name: string
+  path?: string
   data?: string
   previewUrl?: string
+  lineStart?: number
+  lineEnd?: number
+  note?: string
+  quote?: string
 }
 
 type Props = {
@@ -35,7 +40,7 @@ export function AttachmentGallery({ attachments, variant = 'message', onRemove }
 
   return (
     <>
-      <div className={isComposer ? 'flex flex-wrap items-center gap-2' : 'grid grid-cols-1 gap-2 sm:grid-cols-2'}>
+      <div className={isComposer ? 'flex flex-wrap items-center gap-2' : 'flex flex-wrap justify-end gap-2'}>
         {attachments.map((attachment, index) => {
           if (attachment.type === 'image' && (attachment.previewUrl || attachment.data)) {
             const src = attachment.previewUrl || attachment.data || ''
@@ -80,18 +85,29 @@ export function AttachmentGallery({ attachments, variant = 'message', onRemove }
           return (
             <div
               key={attachment.id || `${attachment.name}-${index}`}
-              className="flex items-center gap-2 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-3 py-2 text-xs text-[var(--color-text-secondary)]"
+              className={[
+                'group/file inline-flex max-w-full min-w-0 items-center gap-2 rounded-full border border-[var(--color-border)]',
+                'bg-[var(--color-surface-container-low)] text-[var(--color-text-secondary)] shadow-[0_1px_2px_rgba(0,0,0,0.04)]',
+                isComposer ? 'h-9 px-3' : 'h-9 px-3',
+              ].join(' ')}
             >
-              <span className="material-symbols-outlined text-[14px]">attach_file</span>
-              <span className="max-w-[220px] truncate">{attachment.name}</span>
+              <span className="material-symbols-outlined shrink-0 text-[17px] text-[var(--color-text-tertiary)]">
+                {attachment.lineStart ? 'chat_bubble' : 'description'}
+              </span>
+              <span className="min-w-0 max-w-[220px] truncate text-[13px] font-medium leading-none text-[var(--color-text-primary)]">
+                {attachment.name}
+                {attachment.lineStart
+                  ? `:L${attachment.lineStart}${attachment.lineEnd && attachment.lineEnd !== attachment.lineStart ? `-L${attachment.lineEnd}` : ''}`
+                  : ''}
+              </span>
               {onRemove && attachment.id && (
                 <button
                   type="button"
                   onClick={() => onRemove(attachment.id!)}
-                  className="ml-1 text-[var(--color-text-tertiary)] transition-colors hover:text-[var(--color-error)]"
+                  className="ml-0.5 flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[var(--color-text-tertiary)] transition-colors hover:text-[var(--color-text-primary)]"
                   aria-label={`Remove ${attachment.name}`}
                 >
-                  <span className="material-symbols-outlined text-[14px]">close</span>
+                  <span className="material-symbols-outlined text-[17px]">close</span>
                 </button>
               )}
             </div>

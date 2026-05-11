@@ -1,7 +1,7 @@
 # IM 接入
 
 > 当前可用的 IM 接入方案总览。  
-> 如果你只是想把 Telegram 或飞书接进来，从这篇开始。
+> 如果你只是想把微信、钉钉、Telegram 或飞书接进来，从这篇开始。
 
 ## 当前方案是什么
 
@@ -16,7 +16,7 @@ flowchart TD
     C --> D["本地配置持久化"]
     D --> E["~/.claude/adapters.json"]
 
-    E --> F["Telegram / 飞书 Adapter 进程"]
+    E --> F["微信 / 钉钉 / Telegram / 飞书 Adapter 进程"]
     F --> G["加载平台配置"]
     F --> H["校验配对与授权"]
     F --> I["读取 / 写入会话映射"]
@@ -24,11 +24,8 @@ flowchart TD
 
     F --> K{"当前 chatId<br/>是否已有 session?"}
     K -->|有历史映射| L["复用已有 sessionId"]
-    K -->|无历史映射| M{"是否配置<br/>defaultProjectDir?"}
-    M -->|是| N["POST /api/sessions<br/>创建新 session"]
-    M -->|否| O["GET /api/sessions/recent-projects<br/>让用户选择项目"]
-    O --> P["用户回复编号"]
-    P --> N
+    K -->|无历史映射| M["解析工作目录<br/>defaultProjectDir 或当前用户工作目录"]
+    M --> N["POST /api/sessions<br/>创建新 session"]
 
     N --> Q["获得 sessionId"]
     L --> R["连接 /ws/:sessionId"]
@@ -41,14 +38,14 @@ flowchart TD
     U --> V["流式消息 / 权限请求 / 状态事件"]
     V --> S
     S --> F
-    F --> W["Telegram / 飞书用户"]
+    F --> W["微信 / 钉钉 / Telegram / 飞书用户"]
 ```
 
 可以把这条链路理解成四层：
 
 - 配置层：桌面端 webapp 负责填写平台凭据、默认项目和配对码管理
 - 存储层：本地服务端把配置写入 `~/.claude/adapters.json`
-- 适配层：Telegram / 飞书 adapter 进程负责接 IM 平台、做授权检查、恢复或创建会话
+- 适配层：微信 / 钉钉 / Telegram / 飞书 adapter 进程负责接 IM 平台、做授权检查、恢复或创建会话
 - 会话层：adapter 通过 HTTP 创建 session，再通过 WebSocket 把 IM 消息桥接到 Claude Code 会话
 
 ## 用户怎么用
@@ -59,7 +56,7 @@ flowchart TD
 
 - `serverUrl`
 - `defaultProjectDir`
-- Telegram 或飞书各自的凭据
+- 微信 / 钉钉扫码绑定，或填写 Telegram / 飞书各自的凭据
 - 可选 `allowedUsers`
 
 这里的配置会通过 `GET /api/adapters` 和 `PUT /api/adapters` 读写到 `~/.claude/adapters.json`。
@@ -73,11 +70,13 @@ flowchart TD
 - 码有效期 60 分钟
 - 配对成功后立即失效
 
-配对码是平台无关的，同一个码可以在 Telegram 或飞书私聊里使用一次。
+配对码是平台无关的，同一个码可以在微信、钉钉、Telegram 或飞书私聊里使用一次。
+
+微信和钉钉的“扫码绑定”只负责把机器人账号凭据写到本机；具体 IM 用户仍然需要发送配对码，或被加入 `allowedUsers`。
 
 ### 3. 启动对应 Adapter 进程
 
-Webapp 负责配置和配对，不负责代你启动 bot 进程。当前仍需要手动启动：
+发布版桌面端会在本地 server 启动后自动拉起 adapter sidecar，并在保存凭据、扫码绑定或解绑后重启 adapter 让新配置生效。本地开发或单独调试 adapter 时可以手动启动：
 
 ```bash
 cd adapters
@@ -85,13 +84,17 @@ bun install
 bun run telegram
 # 或
 bun run feishu
+# 或
+bun run wechat
+# 或
+bun run dingtalk
 ```
 
 ### 4. 在 IM 里私聊 Bot
 
 - 未配对用户：先把配对码发给 bot
 - 已配对用户：直接发送自然语言消息
-- 没有默认项目时：bot 会先让你从最近项目里选一个
+- 没有默认项目时：bot 会使用当前用户工作目录作为新会话目录
 - 后续消息会复用同一个 Claude session
 
 ## 配置和状态分别存哪
@@ -105,6 +108,8 @@ bun run feishu
 - `pairing`
 - `telegram`
 - `feishu`
+- `wechat`
+- `dingtalk`
 
 其中：
 
@@ -146,15 +151,19 @@ Adapter 不是直接把消息丢给一个全局 Claude 进程，而是：
    - `stop_generation`
 4. 把服务端流式消息再格式化回 IM
 
-如果没有 `defaultProjectDir`，Adapter 会调用 `GET /api/sessions/recent-projects` 让用户先选项目。
+如果没有 `defaultProjectDir`，Adapter 会优先使用当前用户工作目录作为新 session 的工作目录，避免扫码绑定后还必须先在桌面端打开项目。
 
 ## 平台差异
 
 - Telegram：`grammy`，按钮审批，纯私聊模式
 - 飞书：`@larksuiteoapi/node-sdk`，长连接事件订阅，交互卡片审批，当前只处理 `p2p`
+- 微信：扫码绑定账号，`getupdates` 长轮询接收消息，文本命令审批使用 `/allow <requestId>` / `/deny <requestId>`
+- 钉钉：扫码给本机写入 Stream 凭据，`dingtalk-stream` 长连接收发消息，配对码绑定用户后开始聊天
 
 分别看：
 
+- [微信接入](./wechat.md)
+- [钉钉接入](./dingtalk.md)
 - [Telegram 接入](./telegram.md)
 - [飞书接入](./feishu.md)
 

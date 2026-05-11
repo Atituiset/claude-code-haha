@@ -4,7 +4,7 @@
 import { z } from 'zod'
 
 import providerPresetsJson from './providerPresets.json'
-import { ApiFormatSchema } from '../types/provider.js'
+import { ApiFormatSchema, ProviderAuthStrategySchema } from '../types/provider.js'
 
 const ModelMappingSchema = z.object({
   main: z.string(),
@@ -21,6 +21,15 @@ const ProviderPresetSchema = z.object({
   defaultModels: ModelMappingSchema,
   needsApiKey: z.boolean(),
   websiteUrl: z.string(),
+  apiKeyUrl: z.string().optional(),
+  promoText: z.string().optional(),
+  featured: z.boolean().optional(),
+  authStrategy: ProviderAuthStrategySchema.optional(),
+  defaultEnv: z.record(z.string(), z.string()).optional(),
+  modelContextWindows: z.record(
+    z.string().min(1),
+    z.number().int().min(16000).max(10000000),
+  ).optional(),
 })
 
 const ProviderPresetsSchema = z.array(ProviderPresetSchema)

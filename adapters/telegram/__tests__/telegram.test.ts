@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'bun:test'
 import { splitMessage, formatPermissionRequest, truncateInput, escapeMarkdownV2 } from '../../common/format.js'
+import { parsePermitCallbackData } from '../../common/permission.js'
 
 /**
  * Telegram Adapter 翻译逻辑测试
@@ -59,17 +60,19 @@ describe('Telegram message formatting', () => {
 
   describe('callback_data parsing', () => {
     it('parses permit:requestId:yes format', () => {
-      const data = 'permit:abcde:yes'
-      const parts = data.split(':')
-      expect(parts[0]).toBe('permit')
-      expect(parts[1]).toBe('abcde')
-      expect(parts[2]).toBe('yes')
+      expect(parsePermitCallbackData('permit:abcde:yes')).toEqual({ requestId: 'abcde', allowed: true })
+    })
+
+    it('parses permit:requestId:always format', () => {
+      expect(parsePermitCallbackData('permit:abcde:always')).toEqual({
+        requestId: 'abcde',
+        allowed: true,
+        rule: 'always',
+      })
     })
 
     it('parses permit:requestId:no format', () => {
-      const data = 'permit:abcde:no'
-      const parts = data.split(':')
-      expect(parts[2]).toBe('no')
+      expect(parsePermitCallbackData('permit:abcde:no')).toEqual({ requestId: 'abcde', allowed: false })
     })
 
     it('ignores non-permit callbacks', () => {

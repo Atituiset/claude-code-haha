@@ -224,7 +224,10 @@ export async function sendTaskNotification(
   run: TaskRun,
   notification: TaskNotificationConfig,
 ): Promise<void> {
-  if (!notification.enabled || notification.channels.length === 0) return
+  const imChannels = notification.channels.filter((channel): channel is 'telegram' | 'feishu' =>
+    channel === 'telegram' || channel === 'feishu',
+  )
+  if (!notification.enabled || imChannels.length === 0) return
 
   let config: AdapterFileConfig
   try {
@@ -236,7 +239,7 @@ export async function sendTaskNotification(
 
   const markdown = buildMarkdown(run)
 
-  for (const channel of notification.channels) {
+  for (const channel of imChannels) {
     try {
       if (channel === 'telegram') {
         const botToken = config.telegram?.botToken

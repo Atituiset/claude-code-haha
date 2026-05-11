@@ -1,4 +1,4 @@
-import type { ApiFormat } from './provider'
+import type { ApiFormat, ProviderAuthStrategy } from './provider'
 
 export type ModelMapping = {
   main: string
@@ -15,4 +15,10 @@ export type ProviderPreset = {
   defaultModels: ModelMapping
   needsApiKey: boolean
   websiteUrl: string
+  apiKeyUrl?: string
+  promoText?: string
+  featured?: boolean
+  authStrategy?: ProviderAuthStrategy
+  defaultEnv?: Record<string, string>
+  modelContextWindows?: Record<string, number>
 }

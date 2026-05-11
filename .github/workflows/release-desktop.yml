@@ -177,5 +177,5 @@ jobs:
           releaseDraft: ${{ github.event_name == 'workflow_dispatch' && inputs.draft || false }}
           prerelease: false
           updaterJsonPreferNsis: true
-          releaseAssetNamePattern: ${{ matrix.asset_name_pattern }}
-          args: ${{ matrix.tauri_args }} --config src-tauri/tauri.release-ci.json
+          assetNamePattern: ${{ matrix.asset_name_pattern }}
+          args: ${{ matrix.tauri_args }} --ci --config src-tauri/tauri.release-ci.json

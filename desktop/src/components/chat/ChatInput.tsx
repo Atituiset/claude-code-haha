@@ -6,15 +6,22 @@ import { useUIStore } from '../../stores/uiStore'
 import { useSessionStore } from '../../stores/sessionStore'
 import { useSessionRuntimeStore } from '../../stores/sessionRuntimeStore'
 import { useTeamStore } from '../../stores/teamStore'
-import { sessionsApi } from '../../api/sessions'
+import { useSettingsStore } from '../../stores/settingsStore'
+import {
+  formatWorkspaceReferencePrompt,
+  useWorkspaceChatContextStore,
+  type WorkspaceChatReference,
+} from '../../stores/workspaceChatContextStore'
+import { sessionsApi, type SessionGitInfo } from '../../api/sessions'
 import { PermissionModeSelector } from '../controls/PermissionModeSelector'
 import { ModelSelector } from '../controls/ModelSelector'
 import type { AttachmentRef } from '../../types/chat'
 import { AttachmentGallery } from './AttachmentGallery'
 import { ProjectContextChip } from '../shared/ProjectContextChip'
-import { DirectoryPicker } from '../shared/DirectoryPicker'
+import { RepositoryLaunchControls } from '../shared/RepositoryLaunchControls'
 import { FileSearchMenu, type FileSearchMenuHandle } from './FileSearchMenu'
 import { LocalSlashCommandPanel, type LocalSlashCommandName } from './LocalSlashCommandPanel'
+import { ContextUsageIndicator } from './ContextUsageIndicator'
 import {
   FALLBACK_SLASH_COMMANDS,
   findSlashTrigger,
@@ -22,24 +29,48 @@ import {
   replaceSlashToken,
   resolveSlashUiAction,
 } from './composerUtils'
+import { useMobileViewport } from '../../hooks/useMobileViewport'
+import { isTauriRuntime } from '../../lib/desktopRuntime'
 
-type GitInfo = { branch: string | null; repoName: string | null; workDir: string; changedFiles: number }
+type GitInfo = SessionGitInfo
 
 type Attachment = {
   id: string
   name: string
   type: 'image' | 'file'
+  path?: string
   mimeType?: string
   previewUrl?: string
   data?: string
+  lineStart?: number
+  lineEnd?: number
+  note?: string
+  quote?: string
 }
 
 type ChatInputProps = {
   variant?: 'default' | 'hero'
+  compact?: boolean
 }
 
-export function ChatInput({ variant = 'default' }: ChatInputProps) {
+const EMPTY_WORKSPACE_REFERENCES: WorkspaceChatReference[] = []
+
+function workspaceReferenceToAttachment(reference: WorkspaceChatReference): Attachment {
+  return {
+    id: reference.id,
+    name: reference.name,
+    type: 'file',
+    path: reference.path,
+    lineStart: reference.lineStart,
+    lineEnd: reference.lineEnd,
+    note: reference.note,
+    quote: reference.quote,
+  }
+}
+
+export function ChatInput({ variant = 'default', compact = false }: ChatInputProps) {
   const t = useTranslation()
+  const isMobileComposer = useMobileViewport() && !isTauriRuntime()
   const [input, setInput] = useState('')
   const [attachments, setAttachments] = useState<Attachment[]>([])
   const [plusMenuOpen, setPlusMenuOpen] = useState(false)
@@ -50,6 +81,11 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
   const [atCursorPos, setAtCursorPos] = useState(-1)
   const [slashFilter, setSlashFilter] = useState('')
   const [slashSelectedIndex, setSlashSelectedIndex] = useState(0)
+  const [launchWorkDir, setLaunchWorkDir] = useState('')
+  const [launchBranch, setLaunchBranch] = useState<string | null>(null)
+  const [launchUseWorktree, setLaunchUseWorktree] = useState(false)
+  const [launchReady, setLaunchReady] = useState(true)
+  const [launchTransitioning, setLaunchTransitioning] = useState(false)
   const composingRef = useRef(false)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -63,17 +99,51 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
   const chatState = sessionState?.chatState ?? 'idle'
   const slashCommands = sessionState?.slashCommands ?? []
   const composerPrefill = sessionState?.composerPrefill ?? null
+  const runtimeSelection = useSessionRuntimeStore((state) =>
+    activeTabId ? state.selections[activeTabId] : undefined,
+  )
+  const currentModel = useSettingsStore((state) => state.currentModel)
+  const runtimeSelectionKey = runtimeSelection
+    ? `${runtimeSelection.providerId ?? 'official'}:${runtimeSelection.modelId}`
+    : undefined
+  const runtimeModelLabel = runtimeSelection?.modelId ?? currentModel?.name ?? currentModel?.id
   const activeSession = useSessionStore((state) => activeTabId ? state.sessions.find((session) => session.id === activeTabId) ?? null : null)
+  const loadedMessageCount = sessionState?.messages?.length ?? 0
+  const messageCount = Math.max(loadedMessageCount, activeSession?.messageCount ?? 0)
   const memberInfo = useTeamStore((s) => activeTabId ? s.getMemberBySessionId(activeTabId) : null)
   const [gitInfo, setGitInfo] = useState<GitInfo | null>(null)
-  const hasMessages = useChatStore((s) => activeTabId ? (s.sessions[activeTabId]?.messages?.length ?? 0) > 0 : false)
+  const workspaceReferences = useWorkspaceChatContextStore(
+    (s) => activeTabId ? s.referencesBySession[activeTabId] ?? EMPTY_WORKSPACE_REFERENCES : EMPTY_WORKSPACE_REFERENCES,
+  )
+  const addWorkspaceReference = useWorkspaceChatContextStore((s) => s.addReference)
+  const removeWorkspaceReference = useWorkspaceChatContextStore((s) => s.removeReference)
+  const clearWorkspaceReferences = useWorkspaceChatContextStore((s) => s.clearReferences)
 
   const isMemberSession = !!memberInfo
   const isActive = chatState !== 'idle'
   const isWorkspaceMissing = activeSession?.workDirExists === false
-  const canSubmit = !isWorkspaceMissing && (input.trim().length > 0 || (!isMemberSession && attachments.length > 0))
-  const isHeroComposer = variant === 'hero' && !isMemberSession
+  const hasWorkspaceReferences = !isMemberSession && workspaceReferences.length > 0
+  const isHeroComposer = variant === 'hero' && !isMemberSession && !compact
   const resolvedWorkDir = activeSession?.workDir || gitInfo?.workDir || undefined
+  const showLaunchControls = !isMemberSession && messageCount === 0
+  const useCompactControls = compact || isMobileComposer
+  const iconOnlyAction = compact || isMobileComposer
+  const activeLaunchWorkDir = showLaunchControls ? (launchWorkDir || resolvedWorkDir || '') : (resolvedWorkDir || '')
+  const pendingSlashUiAction = !isMemberSession && input.trim().startsWith('/')
+    ? resolveSlashUiAction(input.trim().slice(1))
+    : null
+  const canSubmit = !isWorkspaceMissing &&
+    !launchTransitioning &&
+    (!showLaunchControls || launchReady || !!pendingSlashUiAction) &&
+    (input.trim().length > 0 || (!isMemberSession && (attachments.length > 0 || hasWorkspaceReferences)))
+  const composerAttachments = useMemo(
+    () => [
+      ...attachments,
+      ...workspaceReferences.map(workspaceReferenceToAttachment),
+    ],
+    [attachments, workspaceReferences],
+  )
+  const slashCommandCount = slashCommands.length
 
   useEffect(() => {
     textareaRef.current?.focus()
@@ -110,7 +180,7 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
     })
   }, [composerPrefill])
 
-  useEffect(() => {
+  const refreshGitInfo = useCallback(() => {
     if (!activeTabId) {
       setGitInfo(null)
       return
@@ -123,12 +193,34 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
   }, [activeTabId, isMemberSession])
 
   useEffect(() => {
+    refreshGitInfo()
+  }, [refreshGitInfo])
+
+  useEffect(() => {
+    if (!activeTabId || isMemberSession || messageCount === 0) return
+    const timeout = setTimeout(refreshGitInfo, chatState === 'idle' ? 0 : 500)
+    return () => clearTimeout(timeout)
+  }, [activeTabId, chatState, isMemberSession, messageCount, refreshGitInfo, slashCommandCount])
+
+  useEffect(() => {
     if (!isMemberSession) return
     setAttachments([])
     setPlusMenuOpen(false)
     setSlashMenuOpen(false)
     setFileSearchOpen(false)
   }, [isMemberSession, activeTabId])
+
+  useEffect(() => {
+    if (!showLaunchControls) return
+    const nextWorkDir = activeSession?.workDir || gitInfo?.workDir || ''
+    setLaunchWorkDir((current) => {
+      if (current === nextWorkDir) return current
+      setLaunchBranch(null)
+      setLaunchUseWorktree(false)
+      setLaunchReady(!nextWorkDir)
+      return nextWorkDir
+    })
+  }, [activeSession?.workDir, activeTabId, gitInfo?.workDir, showLaunchControls])
 
   useEffect(() => {
     const el = textareaRef.current
@@ -197,15 +289,20 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
     return () => document.removeEventListener('mousedown', handleClick)
   }, [fileSearchOpen])
 
+  const allSlashCommands = useMemo(
+    () => mergeSlashCommands(slashCommands, FALLBACK_SLASH_COMMANDS),
+    [slashCommands],
+  )
+
   const filteredCommands = useMemo(() => {
-    const source = mergeSlashCommands(slashCommands, FALLBACK_SLASH_COMMANDS)
+    const source = allSlashCommands
     if (!slashFilter) return source
     const lower = slashFilter.toLowerCase()
     return source.filter((command) => (
       command.name.toLowerCase().includes(lower) ||
       command.description.toLowerCase().includes(lower)
     ))
-  }, [slashCommands, slashFilter])
+  }, [allSlashCommands, slashFilter])
 
   const exactSlashCommand = useMemo(() => {
     const normalized = slashFilter.trim().toLowerCase()
@@ -265,7 +362,7 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
     // Extract filter text after @
     const filter = textBeforeCursor.slice(pos + 1)
     setAtFilter(filter)
-    setAtCursorPos(cursorPos)
+    setAtCursorPos(pos)
     setSlashMenuOpen(false)
     setFileSearchOpen(true)
   }, [])
@@ -295,13 +392,53 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
     })
   }, [input])
 
-  const handleSubmit = () => {
-    const text = input.trim()
-    if ((!text && (!attachments.length || isMemberSession)) || isWorkspaceMissing) return
+  const replaceEmptySession = useCallback(async (
+    workDir: string,
+    repository?: { branch?: string | null; worktree?: boolean },
+  ) => {
+    if (!activeTabId) return null
+    const oldId = activeTabId
+    const { createSession, deleteSession } = useSessionStore.getState()
+    const { replaceTabSession } = useTabStore.getState()
+    const { disconnectSession, connectToSession } = useChatStore.getState()
+    const newId = await createSession(
+      workDir || undefined,
+      repository ? { repository } : undefined,
+    )
+    useSessionRuntimeStore.getState().moveSelection(oldId, newId)
+    disconnectSession(oldId)
+    replaceTabSession(oldId, newId)
+    connectToSession(newId)
+    deleteSession(oldId).catch(() => {})
+    return newId
+  }, [activeTabId])
 
-    const slashUiAction = !isMemberSession && text.startsWith('/') ? resolveSlashUiAction(text.slice(1)) : null
-    if (slashUiAction?.type === 'panel') {
-      setLocalSlashPanel(slashUiAction.command as LocalSlashCommandName)
+  const handleLaunchWorkDirChange = useCallback(async (newWorkDir: string) => {
+    setLaunchWorkDir(newWorkDir)
+    setLaunchBranch(null)
+    setLaunchUseWorktree(false)
+    setLaunchReady(!newWorkDir)
+    if (!activeTabId) return
+
+    setLaunchTransitioning(true)
+    try {
+      await replaceEmptySession(newWorkDir)
+    } catch (error) {
+      useUIStore.getState().addToast({
+        type: 'error',
+        message: error instanceof Error ? error.message : t('empty.failedToCreate'),
+      })
+    } finally {
+      setLaunchTransitioning(false)
+    }
+  }, [activeTabId, replaceEmptySession, t])
+
+  const handleSubmit = async () => {
+    const text = input.trim()
+    if ((!text && ((!attachments.length && !hasWorkspaceReferences) || isMemberSession)) || isWorkspaceMissing) return
+
+    if (pendingSlashUiAction?.type === 'panel') {
+      setLocalSlashPanel(pendingSlashUiAction.command as LocalSlashCommandName)
       setInput('')
       setSlashMenuOpen(false)
       setFileSearchOpen(false)
@@ -309,8 +446,8 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
       return
     }
 
-    if (slashUiAction?.type === 'settings') {
-      useUIStore.getState().setPendingSettingsTab(slashUiAction.tab)
+    if (pendingSlashUiAction?.type === 'settings') {
+      useUIStore.getState().setPendingSettingsTab(pendingSlashUiAction.tab)
       useTabStore.getState().openTab(SETTINGS_TAB_ID, 'Settings', 'settings')
       setInput('')
       setSlashMenuOpen(false)
@@ -319,16 +456,86 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
       return
     }
 
-    const attachmentPayload: AttachmentRef[] = attachments.map((attachment) => ({
+    if (showLaunchControls && (!launchReady || launchTransitioning)) return
+
+    const workspaceReferencePrompt = !isMemberSession
+      ? formatWorkspaceReferencePrompt(workspaceReferences)
+      : ''
+    const contentForModel = [workspaceReferencePrompt, text].filter(Boolean).join('\n\n')
+    const displayContent = text || (
+      workspaceReferences.length > 0
+        ? t('chat.workspaceReferencesOnly', { count: workspaceReferences.length })
+        : ''
+    )
+    const uploadAttachmentPayload: AttachmentRef[] = attachments.map((attachment) => ({
       type: attachment.type,
       name: attachment.name,
+      path: attachment.path,
       data: attachment.data,
       mimeType: attachment.mimeType,
+      lineStart: attachment.lineStart,
+      lineEnd: attachment.lineEnd,
+      note: attachment.note,
+      quote: attachment.quote,
     }))
+    const workspaceAttachmentPayload: AttachmentRef[] = workspaceReferences.map((reference) => ({
+      type: 'file' as const,
+      name: reference.name,
+      path: reference.absolutePath ?? reference.path,
+      lineStart: reference.lineStart,
+      lineEnd: reference.lineEnd,
+      note: reference.note,
+      quote: reference.quote,
+    }))
+    const visibleAttachmentPayload: AttachmentRef[] = [
+      ...uploadAttachmentPayload,
+      ...workspaceReferences.map((reference) => ({
+        type: 'file' as const,
+        name: reference.name,
+        path: reference.path,
+        lineStart: reference.lineStart,
+        lineEnd: reference.lineEnd,
+        note: reference.note,
+        quote: reference.quote,
+      })),
+    ]
 
-    sendMessage(activeTabId!, text, attachmentPayload)
+    let targetSessionId = activeTabId!
+    if (showLaunchControls && activeLaunchWorkDir && launchBranch) {
+      const shouldReplaceForRepositoryLaunch =
+        launchUseWorktree ||
+        (gitInfo?.branch ? launchBranch !== gitInfo.branch : true)
+      if (shouldReplaceForRepositoryLaunch) {
+        setLaunchTransitioning(true)
+        try {
+          const newSessionId = await replaceEmptySession(activeLaunchWorkDir, {
+            branch: launchBranch,
+            worktree: launchUseWorktree,
+          })
+          if (!newSessionId) return
+          targetSessionId = newSessionId
+        } catch (error) {
+          useUIStore.getState().addToast({
+            type: 'error',
+            message: error instanceof Error ? error.message : t('empty.failedToCreate'),
+          })
+          return
+        } finally {
+          setLaunchTransitioning(false)
+        }
+      }
+    }
+
+    sendMessage(targetSessionId, contentForModel, [...uploadAttachmentPayload, ...workspaceAttachmentPayload], {
+      displayContent,
+      displayAttachments: visibleAttachmentPayload,
+    })
     setInput('')
     setAttachments([])
+    if (!isMemberSession) {
+      clearWorkspaceReferences(activeTabId!)
+      if (targetSessionId !== activeTabId) clearWorkspaceReferences(targetSessionId)
+    }
     setPlusMenuOpen(false)
     setSlashMenuOpen(false)
     setFileSearchOpen(false)
@@ -355,6 +562,14 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
       }
       // Other keys (typing) should go to the textarea - let it propagate
       return
+    }
+
+    if (localSlashPanel) {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setLocalSlashPanel(null)
+        return
+      }
     }
 
     if (slashMenuOpen && filteredCommands.length > 0) {
@@ -474,6 +689,7 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
 
   const removeAttachment = (id: string) => {
     setAttachments((prev) => prev.filter((attachment) => attachment.id !== id))
+    if (activeTabId) removeWorkspaceReference(activeTabId, id)
   }
 
   const insertSlashCommand = () => {
@@ -504,25 +720,71 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
   const slashCommandsLabel = isHeroComposer ? t('empty.slashCommands') : t('chat.slashCommands')
 
   return (
-    <div className={isHeroComposer ? 'bg-[var(--color-surface)] px-8 pb-4' : 'bg-[var(--color-surface)] px-4 py-4'}>
-      <div className={isHeroComposer ? 'mx-auto flex w-full max-w-3xl flex-col gap-2' : 'mx-auto max-w-[860px]'}>
+    <div
+      data-testid="chat-input-shell"
+      className={
+        isHeroComposer
+          ? `bg-[var(--color-surface)] ${isMobileComposer ? 'px-4 pb-3' : 'px-8 pb-4'}`
+          : compact
+            ? `border-t border-[var(--color-border)]/70 bg-[var(--color-surface)] ${isMobileComposer ? 'px-3 pb-[calc(env(safe-area-inset-bottom)+10px)] pt-2' : 'px-3 py-3'}`
+            : `bg-[var(--color-surface)] ${isMobileComposer ? 'px-3 pb-[calc(env(safe-area-inset-bottom)+10px)] pt-2' : 'px-4 py-4'}`
+      }
+    >
+      <div
+        className={
+          isHeroComposer
+            ? 'mx-auto flex w-full max-w-3xl flex-col'
+          : compact
+              ? 'mx-auto max-w-full'
+              : `${isMobileComposer ? 'mx-0 max-w-none' : 'mx-auto max-w-[860px]'}`
+        }
+      >
         <div
+          data-testid="chat-input-panel"
           className={isHeroComposer
-            ? 'glass-panel relative flex flex-col gap-3 rounded-xl p-4 transition-colors'
-            : 'glass-panel relative rounded-xl p-4 transition-colors'}
+            ? 'glass-panel relative flex flex-col gap-3 rounded-t-xl rounded-b-none p-4 transition-colors'
+            : compact
+              ? `glass-panel relative p-3 transition-colors ${isMobileComposer ? 'rounded-2xl shadow-[0_-12px_36px_rgba(54,35,28,0.12)]' : 'rounded-xl'}`
+              : `glass-panel relative transition-colors ${isMobileComposer ? 'rounded-2xl p-3 shadow-[0_-12px_36px_rgba(54,35,28,0.12)]' : 'rounded-xl p-4'}`}
           onDragOver={(event) => event.preventDefault()}
           onDrop={handleDrop}
         >
           {!isMemberSession && fileSearchOpen && (
             <FileSearchMenu
               ref={fileSearchRef}
-              cwd={resolvedWorkDir || ''}
+              cwd={activeLaunchWorkDir || resolvedWorkDir || ''}
               filter={atFilter}
-              onSelect={(_path, name) => {
+              compact={isMobileComposer}
+              onNavigate={(relativePath) => {
+                if (atCursorPos < 0) return
+                const replacement = `@${relativePath}`
+                const tokenEnd = atCursorPos + 1 + atFilter.length
+                const newValue = `${input.slice(0, atCursorPos)}${replacement}${input.slice(tokenEnd)}`
+                const newCursorPos = atCursorPos + replacement.length
+                setInput(newValue)
+                setAtFilter(relativePath)
+                requestAnimationFrame(() => {
+                  textareaRef.current?.focus()
+                  textareaRef.current?.setSelectionRange(newCursorPos, newCursorPos)
+                })
+              }}
+              onSelect={(path, name) => {
                 if (atCursorPos >= 0) {
-                  // Insert name at cursor position, replacing filter text
-                  const newValue = `${input.slice(0, atCursorPos)}${name}${input.slice(atCursorPos)}`
-                  const newCursorPos = atCursorPos + name.length
+                  const referenceName = name.split('/').filter(Boolean).pop() ?? name
+                  const tokenEnd = atCursorPos + 1 + atFilter.length
+                  const beforeToken = input.slice(0, atCursorPos)
+                  const afterToken = beforeToken ? input.slice(tokenEnd) : input.slice(tokenEnd).replace(/^\s+/, '')
+                  const spacer = beforeToken && afterToken && !/\s$/.test(beforeToken) && !/^\s/.test(afterToken) ? ' ' : ''
+                  const newValue = `${beforeToken}${spacer}${afterToken}`
+                  const newCursorPos = atCursorPos + spacer.length
+                  if (activeTabId) {
+                    addWorkspaceReference(activeTabId, {
+                      kind: 'file',
+                      path,
+                      absolutePath: path,
+                      name: referenceName,
+                    })
+                  }
                   setInput(newValue)
                   setFileSearchOpen(false)
                   setAtFilter('')
@@ -540,7 +802,9 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
             <div ref={slashMenuRef}>
               <LocalSlashCommandPanel
                 command={localSlashPanel}
-                cwd={resolvedWorkDir}
+                sessionId={activeTabId ?? undefined}
+                cwd={activeLaunchWorkDir || resolvedWorkDir}
+                commands={allSlashCommands}
                 onClose={() => setLocalSlashPanel(null)}
               />
             </div>
@@ -573,23 +837,25 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
                   </button>
                 ))}
               </div>
-              <div className="flex items-center gap-1.5 border-t border-[var(--color-border)] px-4 py-2 text-xs text-[var(--color-text-tertiary)]">
-                <kbd className="rounded border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-1.5 py-0.5 font-mono text-[10px]">Up/Down</kbd>
-                <span>{t('chat.navigate')}</span>
-                <kbd className="ml-2 rounded border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-1.5 py-0.5 font-mono text-[10px]">Enter</kbd>
-                <span>{t('chat.select')}</span>
-                <kbd className="ml-2 rounded border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-1.5 py-0.5 font-mono text-[10px]">Esc</kbd>
-                <span>{t('chat.dismiss')}</span>
-              </div>
+              {!isMobileComposer ? (
+                <div className="flex items-center gap-1.5 border-t border-[var(--color-border)] px-4 py-2 text-xs text-[var(--color-text-tertiary)]">
+                  <kbd className="rounded border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-1.5 py-0.5 font-mono text-[10px]">Up/Down</kbd>
+                  <span>{t('chat.navigate')}</span>
+                  <kbd className="ml-2 rounded border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-1.5 py-0.5 font-mono text-[10px]">Enter</kbd>
+                  <span>{t('chat.select')}</span>
+                  <kbd className="ml-2 rounded border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-1.5 py-0.5 font-mono text-[10px]">Esc</kbd>
+                  <span>{t('chat.dismiss')}</span>
+                </div>
+              ) : null}
             </div>
           )}
 
-          {attachments.length > 0 && (
+          {composerAttachments.length > 0 && (
             isHeroComposer ? (
-              <AttachmentGallery attachments={attachments} variant="composer" onRemove={removeAttachment} />
+              <AttachmentGallery attachments={composerAttachments} variant="composer" onRemove={removeAttachment} />
             ) : (
               <div className="px-3 pt-3">
-                <AttachmentGallery attachments={attachments} variant="composer" onRemove={removeAttachment} />
+                <AttachmentGallery attachments={composerAttachments} variant="composer" onRemove={removeAttachment} />
               </div>
             )
           )}
@@ -622,27 +888,31 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
               placeholder={composerPlaceholder}
               disabled={isWorkspaceMissing}
               rows={1}
-              className="w-full resize-none bg-transparent py-2 pb-12 text-sm leading-relaxed text-[var(--color-text-primary)] outline-none placeholder:text-[var(--color-text-tertiary)] disabled:opacity-50"
+              className={`w-full resize-none bg-transparent text-sm leading-relaxed text-[var(--color-text-primary)] outline-none placeholder:text-[var(--color-text-tertiary)] disabled:opacity-50 ${
+                useCompactControls ? 'py-1.5 pb-14' : 'py-2 pb-12'
+              }`}
             />
           )}
 
           <div className={isHeroComposer
             ? 'flex items-center justify-between border-t border-[var(--color-border-separator)] pt-3'
-            : 'absolute bottom-0 left-0 right-0 flex items-center justify-between border-t border-[var(--color-border-separator)] px-3 py-3'}>
-            <div className="flex items-center gap-2">
+            : `absolute bottom-0 left-0 right-0 flex items-center justify-between border-t border-[var(--color-border-separator)] ${
+              useCompactControls ? 'gap-2 px-2.5 py-2' : 'px-3 py-3'
+            }`}>
+            <div className="flex min-w-0 items-center gap-2">
               {!isMemberSession && (
                 <>
                   <div ref={plusMenuRef} className="relative">
                     <button
                       onClick={() => setPlusMenuOpen((value) => !value)}
                       aria-label="Open composer tools"
-                      className="rounded-[var(--radius-md)] p-1.5 text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)]"
+                      className={`text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] ${isMobileComposer ? 'inline-flex h-11 w-11 items-center justify-center rounded-xl' : 'rounded-[var(--radius-md)] p-1.5'}`}
                     >
                       <span className="material-symbols-outlined text-[18px]">add</span>
                     </button>
 
                     {plusMenuOpen && (
-                      <div className="absolute bottom-full left-0 z-50 mb-2 w-[240px] rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] py-1 shadow-[var(--shadow-dropdown)]">
+                      <div className={`absolute bottom-full left-0 z-50 mb-2 rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] py-1 shadow-[var(--shadow-dropdown)] ${isMobileComposer ? 'w-[min(240px,calc(100vw-32px))]' : 'w-[240px]'}`}>
                         <button
                           onClick={() => {
                             fileInputRef.current?.click()
@@ -664,20 +934,41 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
                     )}
                   </div>
 
-                  <PermissionModeSelector />
+                  <PermissionModeSelector compact={useCompactControls} />
                 </>
               )}
             </div>
 
-            <div className="flex items-center gap-2">
+            <div className="flex min-w-0 items-center gap-2">
               {!isMemberSession && activeTabId && (
-                <ModelSelector runtimeKey={activeTabId} disabled={isActive} />
+                <ContextUsageIndicator
+                  sessionId={activeTabId}
+                  chatState={chatState}
+                  messageCount={messageCount}
+                  runtimeSelectionKey={runtimeSelectionKey}
+                  fallbackModelLabel={runtimeModelLabel}
+                  compact={useCompactControls}
+                />
+              )}
+              {!isMemberSession && activeTabId && (
+                <ModelSelector runtimeKey={activeTabId} disabled={isActive} compact={useCompactControls} />
               )}
               <button
                 onClick={!isMemberSession && isActive ? () => stopGeneration(activeTabId!) : handleSubmit}
                 disabled={!isMemberSession && isActive ? false : !canSubmit}
-                title={!isMemberSession && isActive ? t('chat.stopTitle') : undefined}
-                className={`flex w-[112px] items-center justify-center gap-1 rounded-lg px-3 py-1.5 text-xs font-semibold transition-all hover:brightness-105 disabled:opacity-30 ${
+                aria-label={!isMemberSession && isActive ? t('common.stop') : isMemberSession ? t('common.send') : t('common.run')}
+                title={
+                  !isMemberSession && isActive
+                    ? t('chat.stopTitle')
+                    : iconOnlyAction
+                      ? isMemberSession
+                        ? t('common.send')
+                        : t('common.run')
+                      : undefined
+                }
+                className={`flex shrink-0 items-center justify-center gap-1 rounded-lg text-xs font-semibold transition-all hover:brightness-105 disabled:opacity-30 ${
+                  iconOnlyAction ? `${isMobileComposer ? 'h-11 w-11 rounded-xl px-0 py-0' : 'h-8 w-8 px-0 py-0'}` : 'w-[112px] px-3 py-1.5'
+                } ${
                   !isMemberSession && isActive
                     ? 'bg-[var(--color-error-container)] text-[var(--color-on-error-container)]'
                     : 'bg-[image:var(--gradient-btn-primary)] text-[var(--color-btn-primary-fg)] shadow-[var(--shadow-button-primary)]'
@@ -686,7 +977,7 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
                 <span className="material-symbols-outlined text-[14px]">
                   {!isMemberSession && isActive ? 'stop' : 'arrow_forward'}
                 </span>
-                {!isMemberSession && isActive ? t('common.stop') : isMemberSession ? t('common.send') : t('common.run')}
+                {!iconOnlyAction && (!isMemberSession && isActive ? t('common.stop') : isMemberSession ? t('common.send') : t('common.run'))}
               </button>
             </div>
           </div>
@@ -695,29 +986,28 @@ export function ChatInput({ variant = 'default' }: ChatInputProps) {
         <input ref={fileInputRef} type="file" multiple className="hidden" onChange={handleFileSelect} />
 
         {!isMemberSession && (
-          <div className="mt-3 px-1">
-            {hasMessages ? (
+          <div className={useCompactControls ? 'mt-2 flex min-w-0 px-1' : 'mt-3 px-1'}>
+            {messageCount > 0 ? (
               <ProjectContextChip
                 workDir={resolvedWorkDir}
                 repoName={gitInfo?.repoName || null}
                 branch={gitInfo?.branch || null}
+                sourceWorkDir={gitInfo?.worktree?.sourceWorkDir || null}
+                isWorktree={!!gitInfo?.worktree?.enabled}
+                worktreeSlug={gitInfo?.worktree?.slug || null}
+                worktreePath={gitInfo?.worktree?.path || gitInfo?.worktree?.plannedPath || null}
+                compact={useCompactControls}
               />
             ) : (
-              <DirectoryPicker
-                value={resolvedWorkDir || ''}
-                onChange={async (newWorkDir) => {
-                  if (!activeTabId) return
-                  const oldId = activeTabId
-                  const { deleteSession, createSession } = useSessionStore.getState()
-                  const { replaceTabSession } = useTabStore.getState()
-                  const { disconnectSession, connectToSession } = useChatStore.getState()
-                  const newId = await createSession(newWorkDir)
-                  useSessionRuntimeStore.getState().moveSelection(oldId, newId)
-                  disconnectSession(oldId)
-                  replaceTabSession(oldId, newId)
-                  connectToSession(newId)
-                  deleteSession(oldId).catch(() => {})
-                }}
+              <RepositoryLaunchControls
+                workDir={activeLaunchWorkDir}
+                onWorkDirChange={handleLaunchWorkDirChange}
+                branch={launchBranch}
+                onBranchChange={setLaunchBranch}
+                useWorktree={launchUseWorktree}
+                onUseWorktreeChange={setLaunchUseWorktree}
+                onLaunchReadyChange={setLaunchReady}
+                disabled={isActive || launchTransitioning}
               />
             )}
           </div>

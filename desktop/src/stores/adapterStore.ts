@@ -1,10 +1,11 @@
 import { create } from 'zustand'
 import { adaptersApi } from '../api/adapters'
 import type { AdapterFileConfig } from '../types/adapter'
+import type { DingtalkRegistrationBegin, DingtalkRegistrationPoll } from '../api/adapters'
 
 /**
  * Tauri command 触发器：让主进程 kill + respawn adapter sidecar，
- * 让 ~/.claude/adapters.json 里的最新凭据被新进程读到，建立飞书 / Telegram
+ * 让 ~/.claude/adapters.json 里的最新凭据被新进程读到，建立飞书 / Telegram / 微信 / 钉钉
  * 的 WebSocket 连接。
  *
  * 在非 Tauri 环境（纯浏览器调试 / 单元测试）这会安静失败 —— 那种场景下
@@ -48,7 +49,13 @@ type AdapterStore = {
   fetchConfig: () => Promise<void>
   updateConfig: (patch: Partial<AdapterFileConfig>) => Promise<void>
   generatePairingCode: () => Promise<string>
-  removePairedUser: (platform: 'telegram' | 'feishu', userId: string | number) => Promise<void>
+  startWechatLogin: () => Promise<{ qrcodeUrl?: string; message: string; sessionKey: string }>
+  pollWechatLogin: (sessionKey: string) => Promise<{ connected: boolean; status?: string; message?: string }>
+  removePairedUser: (platform: 'telegram' | 'feishu' | 'wechat' | 'dingtalk', userId: string | number) => Promise<void>
+  beginDingtalkRegistration: () => Promise<DingtalkRegistrationBegin>
+  pollDingtalkRegistration: (deviceCode: string) => Promise<DingtalkRegistrationPoll>
+  unbindWechatAccount: () => Promise<void>
+  unbindDingtalkBot: () => Promise<void>
 }
 
 export const useAdapterStore = create<AdapterStore>((set, get) => ({
@@ -88,6 +95,46 @@ export const useAdapterStore = create<AdapterStore>((set, get) => ({
       },
     })
     return code
+  },
+
+  startWechatLogin: async () => {
+    return adaptersApi.startWechatLogin()
+  },
+
+  pollWechatLogin: async (sessionKey) => {
+    const result = await adaptersApi.pollWechatLogin(sessionKey)
+    if ('connected' in result && result.connected === false) {
+      return { connected: false, status: result.status, message: result.message }
+    }
+    if ('wechat' in result || 'telegram' in result || 'feishu' in result || 'dingtalk' in result) {
+      set({ config: result })
+      void notifyTauriRestartAdapters()
+      return { connected: true }
+    }
+    return { connected: false }
+  },
+
+  beginDingtalkRegistration: () => adaptersApi.beginDingtalkRegistration(),
+
+  pollDingtalkRegistration: async (deviceCode) => {
+    const result = await adaptersApi.pollDingtalkRegistration(deviceCode)
+    if (result.config) {
+      set({ config: result.config })
+      void notifyTauriRestartAdapters()
+    }
+    return result
+  },
+
+  unbindWechatAccount: async () => {
+    const config = await adaptersApi.unbindWechat()
+    set({ config })
+    void notifyTauriRestartAdapters()
+  },
+
+  unbindDingtalkBot: async () => {
+    const config = await adaptersApi.unbindDingtalk()
+    set({ config })
+    void notifyTauriRestartAdapters()
   },
 
   removePairedUser: async (platform, userId) => {

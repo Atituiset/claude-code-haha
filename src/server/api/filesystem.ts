@@ -20,7 +20,14 @@ const IMAGE_MIME_TYPES: Record<string, string> = {
 }
 
 function isWithinRoot(targetPath: string, rootPath: string): boolean {
-  return targetPath === rootPath || targetPath.startsWith(`${rootPath}${path.sep}`)
+  const target = normalizeComparablePath(targetPath)
+  const root = normalizeComparablePath(rootPath)
+  return target === root || target.startsWith(`${root}${path.sep}`)
+}
+
+function normalizeComparablePath(filePath: string): string {
+  const resolved = path.resolve(filePath)
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved
 }
 
 function isAllowedFilesystemPath(targetPath: string): boolean {
@@ -95,7 +102,7 @@ async function handleServeFile(url: URL): Promise<Response> {
 }
 
 async function handleBrowse(url: URL): Promise<Response> {
-  const targetPath = url.searchParams.get('path') || process.env.HOME || '/'
+  const targetPath = url.searchParams.get('path') || os.homedir() || '/'
   const resolvedPath = path.resolve(targetPath)
 
   if (!isAllowedFilesystemPath(resolvedPath)) {

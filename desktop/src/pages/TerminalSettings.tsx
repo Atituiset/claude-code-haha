@@ -15,7 +15,27 @@ const STATUS_LABEL_KEYS: Record<TerminalStatus, TranslationKey> = {
   unavailable: 'settings.terminal.status.unavailable',
 }
 
-export function TerminalSettings() {
+type TerminalSettingsProps = {
+  active?: boolean
+  cwd?: string
+  onNewTerminal?: () => void
+  onOpenInTab?: () => void
+  onClose?: () => void
+  testId?: string
+  workspace?: boolean
+  docked?: boolean
+}
+
+export function TerminalSettings({
+  active = true,
+  cwd,
+  onNewTerminal,
+  onOpenInTab,
+  onClose,
+  testId = 'settings-terminal-host',
+  workspace = false,
+  docked = false,
+}: TerminalSettingsProps = {}) {
   const t = useTranslation()
   const hostRef = useRef<HTMLDivElement | null>(null)
   const terminalRef = useRef<XTermTerminal | null>(null)
@@ -130,7 +150,11 @@ export function TerminalSettings() {
     })
 
     try {
-      const result = await terminalApi.spawn({ cols: terminal.cols, rows: terminal.rows })
+      const result = await terminalApi.spawn({
+        cols: terminal.cols,
+        rows: terminal.rows,
+        ...(cwd ? { cwd } : {}),
+      })
       sessionIdRef.current = result.session_id
       setShellInfo({ shell: result.shell, cwd: result.cwd })
       setStatus('running')
@@ -144,7 +168,7 @@ export function TerminalSettings() {
       setError(err instanceof Error ? err.message : String(err))
       setStatus('error')
     }
-  }, [resizeSession])
+  }, [cwd, resizeSession])
 
   useEffect(() => {
     if (!terminalApi.isAvailable()) return
@@ -168,27 +192,61 @@ export function TerminalSettings() {
     }
   }, [resizeSession, startTerminal])
 
+  useEffect(() => {
+    if (active) {
+      requestAnimationFrame(() => resizeSession())
+    }
+  }, [active, resizeSession])
+
   const clearTerminal = () => {
     terminalRef.current?.clear()
   }
 
   return (
-    <div className="flex h-full min-h-[620px] flex-col overflow-hidden">
-      <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+    <div className={`flex h-full flex-col overflow-hidden ${
+      docked
+        ? 'min-h-0 bg-[var(--color-surface-container-lowest)] px-3 py-2'
+        : workspace
+          ? 'min-h-0 bg-[var(--color-surface)] px-5 py-4'
+          : 'min-h-[620px]'
+    }`}>
+      <div className={`${docked ? 'mb-2' : 'mb-3'} flex flex-wrap items-start justify-between gap-3`}>
         <div className="min-w-0">
-          <h2 className="text-base font-semibold text-[var(--color-text-primary)]">
+          <h2 className={`${docked ? 'text-sm' : 'text-base'} font-semibold text-[var(--color-text-primary)]`}>
             {t('settings.terminal.title')}
           </h2>
-          <p className="mt-0.5 max-w-2xl text-sm text-[var(--color-text-tertiary)]">
-            {t('settings.terminal.description')}
-          </p>
+          {!docked && (
+            <p className="mt-0.5 max-w-2xl text-sm text-[var(--color-text-tertiary)]">
+              {t('settings.terminal.description')}
+            </p>
+          )}
         </div>
         <div className="flex items-center gap-2">
+          {onOpenInTab && (
+            <button
+              type="button"
+              onClick={onOpenInTab}
+              className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--color-border)] px-2.5 text-xs font-medium text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
+            >
+              <span className="material-symbols-outlined text-[16px]">open_in_new</span>
+              {t('terminal.openInTab')}
+            </button>
+          )}
+          {onNewTerminal && (
+            <button
+              type="button"
+              onClick={onNewTerminal}
+              className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--color-border)] px-2.5 text-xs font-medium text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
+            >
+              <span className="material-symbols-outlined text-[16px]">add</span>
+              {t('terminal.newTab')}
+            </button>
+          )}
           <button
             type="button"
             onClick={clearTerminal}
             disabled={!terminalRef.current}
-            className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--color-border)] px-2.5 text-xs font-medium text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] disabled:cursor-not-allowed disabled:opacity-50"
+            className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-md)] border border-[var(--color-border)] px-2.5 text-xs font-medium text-[var(--color-text-secondary)] transition-colors hover:bg-[var(--color-surface-hover)] hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)] disabled:cursor-not-allowed disabled:opacity-50"
           >
             <span className="material-symbols-outlined text-[16px]">mop</span>
             {t('settings.terminal.clear')}
@@ -196,15 +254,25 @@ export function TerminalSettings() {
           <button
             type="button"
             onClick={() => void startTerminal()}
-            className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-md)] bg-[var(--color-text-primary)] px-2.5 text-xs font-medium text-[var(--color-surface)] transition-colors hover:opacity-90"
+            className="inline-flex h-8 items-center gap-1.5 rounded-[var(--radius-md)] bg-[var(--color-text-primary)] px-2.5 text-xs font-medium text-[var(--color-surface)] transition-colors hover:opacity-90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
           >
             <span className="material-symbols-outlined text-[16px]">restart_alt</span>
             {t('settings.terminal.restart')}
           </button>
+          {onClose && (
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label={t('terminal.closePanel')}
+              className="inline-flex h-8 w-8 items-center justify-center rounded-[var(--radius-md)] text-[var(--color-text-tertiary)] transition-colors hover:text-[var(--color-text-primary)] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--color-border-focus)]"
+            >
+              <span className="material-symbols-outlined text-[17px]">close</span>
+            </button>
+          )}
         </div>
       </div>
 
-      <div className="mb-3 flex flex-wrap items-center gap-2 text-xs text-[var(--color-text-tertiary)]">
+      <div className={`${docked ? 'mb-2' : 'mb-3'} flex flex-wrap items-center gap-2 text-xs text-[var(--color-text-tertiary)]`}>
         <StatusPill status={status} label={t(STATUS_LABEL_KEYS[status])} />
         {shellInfo && (
           <>
@@ -236,7 +304,7 @@ export function TerminalSettings() {
           </div>
         </div>
       ) : (
-        <div className="min-h-0 flex-1 overflow-hidden rounded-[var(--radius-lg)] border border-[var(--color-terminal-border)] bg-[var(--color-terminal-bg)] shadow-[var(--shadow-dropdown)]">
+        <div className="min-h-0 flex-1 overflow-hidden rounded-[var(--radius-md)] border border-[var(--color-terminal-border)] bg-[var(--color-terminal-bg)] shadow-[var(--shadow-dropdown)]">
           <div className="flex h-8 items-center gap-2 border-b border-[var(--color-terminal-border)] bg-[var(--color-terminal-header)] px-3">
             <span className="h-2.5 w-2.5 rounded-full bg-[var(--color-terminal-danger)]" />
             <span className="h-2.5 w-2.5 rounded-full bg-[var(--color-terminal-warning)]" />
@@ -247,7 +315,7 @@ export function TerminalSettings() {
           </div>
           <div
             ref={hostRef}
-            data-testid="settings-terminal-host"
+            data-testid={testId}
             className="settings-terminal-host h-[calc(100%-2rem)] w-full overflow-hidden p-2"
           />
         </div>

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import '@testing-library/jest-dom'
 
 vi.mock('./ProjectFilter', () => ({
@@ -17,6 +17,7 @@ vi.mock('../../i18n', () => ({
       'sidebar.noMatching': 'No matching sessions',
       'sidebar.sessionListFailed': 'Session list failed',
       'common.retry': 'Retry',
+      'common.loading': 'Loading...',
       'common.cancel': 'Cancel',
       'common.delete': 'Delete',
       'common.rename': 'Rename',
@@ -80,6 +81,7 @@ describe('Sidebar', () => {
   })
 
   afterEach(() => {
+    cleanup()
     useTabStore.setState({ tabs: [], activeTabId: null })
   })
 
@@ -200,5 +202,50 @@ describe('Sidebar', () => {
     render(<Sidebar />)
 
     expect(screen.getByTestId('sidebar-session-list-section')).toHaveClass('flex', 'flex-1', 'min-h-0', 'flex-col')
+  })
+
+  it('keeps mobile navigation focused on chat sessions', async () => {
+    const onRequestClose = vi.fn()
+    createSession.mockResolvedValue('session-mobile-new')
+    useSessionStore.setState({
+      sessions: [
+        {
+          id: 'session-1',
+          title: 'Open Session',
+          createdAt: new Date().toISOString(),
+          modifiedAt: new Date().toISOString(),
+          messageCount: 1,
+          projectPath: '/workspace/project',
+          workDir: '/workspace/project',
+          workDirExists: true,
+        },
+      ],
+    })
+
+    render(<Sidebar isMobile onRequestClose={onRequestClose} />)
+
+    expect(screen.queryByRole('button', { name: 'Scheduled' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Settings' })).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: /Open Session/ }))
+    expect(onRequestClose).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      fireEvent.click(screen.getByRole('button', { name: 'New Session' }))
+    })
+
+    await waitFor(() => {
+      expect(createSession).toHaveBeenCalled()
+    })
+    expect(onRequestClose).toHaveBeenCalledTimes(2)
+  })
+
+  it('shows a loading state instead of an empty session list while initial fetch is pending', () => {
+    useSessionStore.setState({ isLoading: true, sessions: [] })
+
+    render(<Sidebar />)
+
+    expect(screen.getByText('Loading...')).toBeInTheDocument()
+    expect(screen.queryByText('No sessions')).not.toBeInTheDocument()
   })
 })

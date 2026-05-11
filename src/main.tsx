@@ -1003,7 +1003,7 @@ async function run(): Promise<CommanderCommand> {
   // `mcp` and `add` as paths, then choked on --transport as an unknown
   // top-level option. Single-value + collect accumulator means each
   // --plugin-dir takes exactly one arg; repeat the flag for multiple dirs.
-  .option('--plugin-dir <path>', 'Load plugins from a directory for this session only (repeatable: --plugin-dir A --plugin-dir B)', (val: string, prev: string[]) => [...prev, val], [] as string[]).option('--disable-slash-commands', 'Disable all skills', () => true).option('--chrome', 'Enable Claude in Chrome integration').option('--no-chrome', 'Disable Claude in Chrome integration').option('--file <specs...>', 'File resources to download at startup. Format: file_id:relative_path (e.g., --file file_abc:doc.txt file_def:img.png)').action(async (prompt, options) => {
+  .option('--plugin-dir <path>', 'Load plugins from a directory for this session only (repeatable: --plugin-dir A --plugin-dir B)', (val: string, prev: string[]) => [...prev, val], [] as string[]).option('--disable-slash-commands', 'Disable all skills', () => true).option('--chrome', 'Enable Claude in Chrome integration').option('--no-chrome', 'Disable Claude in Chrome integration').option('--no-computer-use', 'Disable Computer Use MCP for this session').option('--file <specs...>', 'File resources to download at startup. Format: file_id:relative_path (e.g., --file file_abc:doc.txt file_def:img.png)').action(async (prompt, options) => {
     profileCheckpoint('action_handler_start');
 
     // --bare = one-switch minimal mode. Sets SIMPLE so all the existing
@@ -1147,6 +1147,9 @@ async function run(): Promise<CommanderCommand> {
     const worktreeOption = isWorktreeModeEnabled() ? (options as {
       worktree?: boolean | string;
     }).worktree : undefined;
+    const worktreeBaseRef = isWorktreeModeEnabled() ? (options as {
+      worktreeBaseRef?: string;
+    }).worktreeBaseRef : undefined;
     let worktreeName = typeof worktreeOption === 'string' ? worktreeOption : undefined;
     const worktreeEnabled = worktreeOption !== undefined;
 
@@ -1610,19 +1613,30 @@ async function run(): Promise<CommanderCommand> {
         const {
           getChicagoEnabled
         } = await import('src/utils/computerUse/gates.js');
-        if (getChicagoEnabled()) {
+        const computerUseCliEnabled = options.computerUse !== false;
+        if (getChicagoEnabled() && computerUseCliEnabled) {
           const {
-            setupComputerUseMCP
-          } = await import('src/utils/computerUse/setup.js');
-          const {
-            mcpConfig,
-            allowedTools: cuTools
-          } = setupComputerUseMCP();
-          dynamicMcpConfig = {
-            ...dynamicMcpConfig,
-            ...mcpConfig
-          };
-          allowedTools.push(...cuTools);
+            loadStoredComputerUseConfig
+          } = await import('src/utils/computerUse/preauthorizedConfig.js');
+          const computerUseConfig = await loadStoredComputerUseConfig();
+          if (!computerUseConfig.enabled) {
+            logForDebugging('[Computer Use MCP] Skipped: disabled in computer-use-config.json');
+          } else {
+            const {
+              setupComputerUseMCP
+            } = await import('src/utils/computerUse/setup.js');
+            const {
+              mcpConfig,
+              allowedTools: cuTools
+            } = setupComputerUseMCP();
+            dynamicMcpConfig = {
+              ...dynamicMcpConfig,
+              ...mcpConfig
+            };
+            allowedTools.push(...cuTools);
+          }
+        } else if (!computerUseCliEnabled) {
+          logForDebugging('[Computer Use MCP] Skipped: disabled by --no-computer-use');
         }
       } catch (error) {
         logForDebugging(`[Computer Use MCP] Setup failed: ${errorMessage(error)}`);
@@ -1929,7 +1943,7 @@ async function run(): Promise<CommanderCommand> {
       const {
         setup
       } = await import('./setup.js');
-      await setup(preSetupCwd, permissionMode, allowDangerouslySkipPermissions, worktreeEnabled, worktreeName, tmuxEnabled, sessionId ? validateUuid(sessionId) : undefined, worktreePRNumber, messagingSocketPath);
+      await setup(preSetupCwd, permissionMode, allowDangerouslySkipPermissions, worktreeEnabled, worktreeName, tmuxEnabled, sessionId ? validateUuid(sessionId) : undefined, worktreePRNumber, worktreeBaseRef, messagingSocketPath);
     })();
     const commandsPromise = worktreeEnabled ? null : getCommands(preSetupCwd);
     const agentDefsPromise = worktreeEnabled ? null : getAgentDefinitionsWithOverrides(preSetupCwd);
@@ -3852,6 +3866,7 @@ async function run(): Promise<CommanderCommand> {
 
   // Worktree flags
   program.option('-w, --worktree [name]', 'Create a new git worktree for this session (optionally specify a name)');
+  program.addOption(new Option('--worktree-base-ref <ref>', 'Create --worktree from this git ref instead of the default branch').hideHelp());
   program.option('--tmux', 'Create a tmux session for the worktree (requires --worktree). Uses iTerm2 native panes when available; use --tmux=classic for traditional tmux.');
   if (canUserConfigureAdvisor()) {
     program.addOption(new Option('--advisor <model>', 'Enable the server-side advisor tool with the specified model (alias or full ID).').hideHelp());
@@ -4141,16 +4156,18 @@ async function run(): Promise<CommanderCommand> {
   // claude auth
 
   const auth = program.command('auth').description('Manage authentication').configureHelp(createSortedHelpConfig());
-  auth.command('login').description('Sign in to your Anthropic account').option('--email <email>', 'Pre-populate email address on the login page').option('--sso', 'Force SSO login flow').option('--console', 'Use Anthropic Console (API usage billing) instead of Claude subscription').option('--claudeai', 'Use Claude subscription (default)').action(async ({
+  auth.command('login').description('Sign in to your Anthropic or OpenAI account').option('--email <email>', 'Pre-populate email address on the login page').option('--sso', 'Force SSO login flow').option('--console', 'Use Anthropic Console (API usage billing) instead of Claude subscription').option('--claudeai', 'Use Claude subscription (default)').option('--openai', 'Use OpenAI ChatGPT/Codex OAuth login').action(async ({
     email,
     sso,
     console: useConsole,
-    claudeai
+    claudeai,
+    openai,
   }: {
     email?: string;
     sso?: boolean;
     console?: boolean;
     claudeai?: boolean;
+    openai?: boolean;
   }) => {
     const {
       authLogin
@@ -4159,23 +4176,27 @@ async function run(): Promise<CommanderCommand> {
       email,
       sso,
       console: useConsole,
-      claudeai
+      claudeai,
+      openai,
     });
   });
-  auth.command('status').description('Show authentication status').option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').action(async (opts: {
+  auth.command('status').description('Show authentication status').option('--json', 'Output as JSON (default)').option('--text', 'Output as human-readable text').option('--openai', 'Show OpenAI OAuth status').action(async (opts: {
     json?: boolean;
     text?: boolean;
+    openai?: boolean;
   }) => {
     const {
       authStatus
     } = await import('./cli/handlers/auth.js');
     await authStatus(opts);
   });
-  auth.command('logout').description('Log out from your Anthropic account').action(async () => {
+  auth.command('logout').description('Log out from your Anthropic or OpenAI account').option('--openai', 'Log out from OpenAI OAuth only').action(async (opts: {
+    openai?: boolean;
+  }) => {
     const {
       authLogout
     } = await import('./cli/handlers/auth.js');
-    await authLogout();
+    await authLogout(opts);
   });
 
   /**

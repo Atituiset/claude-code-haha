@@ -17,10 +17,16 @@ export type FileSearchMenuHandle = {
 type Props = {
   cwd: string
   filter?: string
+  compact?: boolean
   onSelect: (path: string, relativePath: string) => void
+  onNavigate?: (relativePath: string) => void
 }
 
-export const FileSearchMenu = forwardRef<FileSearchMenuHandle, Props>(({ cwd, filter = '', onSelect }, ref) => {
+function joinRelativePath(base: string, name: string) {
+  return [base.replace(/\/+$/, ''), name].filter(Boolean).join('/')
+}
+
+export const FileSearchMenu = forwardRef<FileSearchMenuHandle, Props>(({ cwd, filter = '', compact = false, onSelect, onNavigate }, ref) => {
   const t = useTranslation()
   const [entries, setEntries] = useState<DirEntry[]>([])
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
@@ -118,13 +124,19 @@ export const FileSearchMenu = forwardRef<FileSearchMenuHandle, Props>(({ cwd, fi
     }
     if (e.key === 'Enter' || e.key === 'Tab') {
       e.preventDefault()
-      if (entries[selectedIndex]) {
-        onSelect(entries[selectedIndex]!.path, entries[selectedIndex]!.name)
+      const selected = entries[selectedIndex]
+      if (selected) {
+        if (selected.isDirectory) {
+          void loadDir(selected.path, '')
+          onNavigate?.(`${joinRelativePath(filter.slice(0, filter.lastIndexOf('/') + 1), selected.name)}/`)
+        } else {
+          onSelect(selected.path, joinRelativePath(filter.slice(0, filter.lastIndexOf('/') + 1), selected.name))
+        }
       }
       return
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [entries, selectedIndex])
+  }, [entries, selectedIndex, filter, loadDir, onNavigate, onSelect])
 
   useImperativeHandle(ref, () => ({ handleKeyDown }), [handleKeyDown])
 
@@ -147,7 +159,9 @@ export const FileSearchMenu = forwardRef<FileSearchMenuHandle, Props>(({ cwd, fi
   return (
     <div
       id="file-search-menu"
-      className="absolute left-0 bottom-full mb-2 z-50 w-full min-w-[480px] overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] shadow-[var(--shadow-dropdown)]"
+      className={`absolute bottom-full mb-2 z-50 w-full overflow-hidden rounded-xl border border-[var(--color-border)] bg-[var(--color-surface-container-lowest)] shadow-[var(--shadow-dropdown)] ${
+        compact ? 'left-0 right-0 min-w-0 max-w-[calc(100vw-32px)]' : 'left-0 min-w-[480px]'
+      }`}
       onMouseDown={(e) => e.stopPropagation()}
     >
       {/* Header with path */}
@@ -185,7 +199,8 @@ export const FileSearchMenu = forwardRef<FileSearchMenuHandle, Props>(({ cwd, fi
                 key={entry.path}
                 data-index={i}
                 onClick={() => {
-                  void loadDir(entry.path, filter)
+                  void loadDir(entry.path, '')
+                  onNavigate?.(`${joinRelativePath(filter.slice(0, filter.lastIndexOf('/') + 1), entry.name)}/`)
                 }}
                 onMouseEnter={() => setSelectedIndex(i)}
                 className={`w-full flex items-center gap-3 px-3 py-2 text-left transition-colors ${
@@ -204,7 +219,7 @@ export const FileSearchMenu = forwardRef<FileSearchMenuHandle, Props>(({ cwd, fi
                 <button
                   key={entry.path}
                   data-index={idx}
-                  onClick={() => onSelect(entry.path, entry.name)}
+                  onClick={() => onSelect(entry.path, joinRelativePath(filter.slice(0, filter.lastIndexOf('/') + 1), entry.name))}
                   onMouseEnter={() => setSelectedIndex(idx)}
                   className={`w-full flex items-center gap-3 px-3 py-2 text-left transition-colors ${
                     selectedIndex === idx ? 'bg-[var(--color-surface-hover)]' : 'hover:bg-[var(--color-surface-hover)]'
@@ -220,14 +235,16 @@ export const FileSearchMenu = forwardRef<FileSearchMenuHandle, Props>(({ cwd, fi
       </div>
 
       {/* Footer hint */}
-      <div className="flex items-center gap-1.5 border-t border-[var(--color-border)] px-3 py-1.5 text-[10px] text-[var(--color-text-tertiary)]">
-        <kbd className="rounded border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-1 py-0.5 font-mono">↑↓</kbd>
-        <span>{t('fileSearch.navigate')}</span>
-        <kbd className="ml-2 rounded border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-1 py-0.5 font-mono">Enter</kbd>
-        <span>{t('fileSearch.attach')}</span>
-        <kbd className="ml-2 rounded border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-1 py-0.5 font-mono">Esc</kbd>
-        <span>{t('fileSearch.close')}</span>
-      </div>
+      {!compact ? (
+        <div className="flex items-center gap-1.5 border-t border-[var(--color-border)] px-3 py-1.5 text-[10px] text-[var(--color-text-tertiary)]">
+          <kbd className="rounded border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-1 py-0.5 font-mono">↑↓</kbd>
+          <span>{t('fileSearch.navigate')}</span>
+          <kbd className="ml-2 rounded border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-1 py-0.5 font-mono">Enter</kbd>
+          <span>{t('fileSearch.attach')}</span>
+          <kbd className="ml-2 rounded border border-[var(--color-border)] bg-[var(--color-surface-container-low)] px-1 py-0.5 font-mono">Esc</kbd>
+          <span>{t('fileSearch.close')}</span>
+        </div>
+      ) : null}
     </div>
   )
 })

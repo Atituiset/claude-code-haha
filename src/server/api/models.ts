@@ -11,6 +11,8 @@
 import { SettingsService } from '../services/settingsService.js'
 import { ProviderService } from '../services/providerService.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
+import { hasOpenAIAuthLogin } from '../../utils/auth.js'
+import { OPENAI_CODEX_MODEL_CATALOG } from '../../services/openaiAuth/models.js'
 
 // ─── Fallback models (used when no provider is configured) ────────────────────
 
@@ -42,6 +44,112 @@ const DEFAULT_EFFORT = 'medium'
 
 const settingsService = new SettingsService()
 const providerService = new ProviderService()
+
+type ApiModelInfo = {
+  id: string
+  name: string
+  description: string
+  context: string
+}
+
+function addUniqueModel(
+  models: ApiModelInfo[],
+  model: ApiModelInfo | null,
+): void {
+  if (!model || !model.id.trim()) {
+    return
+  }
+
+  if (models.some(existing => existing.id === model.id)) {
+    return
+  }
+
+  models.push(model)
+}
+
+function buildProviderModelList(models: {
+  main: string
+  haiku: string
+  sonnet: string
+  opus: string
+}): ApiModelInfo[] {
+  const modelList: ApiModelInfo[] = []
+
+  addUniqueModel(modelList, {
+    id: models.main,
+    name: models.main,
+    description: 'Main model',
+    context: '',
+  })
+  addUniqueModel(modelList, models.haiku
+    ? {
+        id: models.haiku,
+        name: models.haiku,
+        description: 'Haiku model',
+        context: '',
+      }
+    : null)
+  addUniqueModel(modelList, models.sonnet
+    ? {
+        id: models.sonnet,
+        name: models.sonnet,
+        description: 'Sonnet model',
+        context: '',
+      }
+    : null)
+  addUniqueModel(modelList, models.opus
+    ? {
+        id: models.opus,
+        name: models.opus,
+        description: 'Opus model',
+        context: '',
+      }
+    : null)
+
+  return modelList
+}
+
+function getEnvConfiguredAnthropicModels(): ApiModelInfo[] {
+  return buildProviderModelList({
+    main: process.env.ANTHROPIC_MODEL?.trim() || '',
+    haiku: process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL?.trim() || '',
+    sonnet: process.env.ANTHROPIC_DEFAULT_SONNET_MODEL?.trim() || '',
+    opus: process.env.ANTHROPIC_DEFAULT_OPUS_MODEL?.trim() || '',
+  })
+}
+
+function getOpenAIAuthModels(): ApiModelInfo[] {
+  if (!hasOpenAIAuthLogin()) {
+    return []
+  }
+
+  return OPENAI_CODEX_MODEL_CATALOG.map(model => ({
+    id: model.value,
+    name: model.label,
+    description: model.description,
+    context: '',
+  }))
+}
+
+function getStandaloneModelList(): ApiModelInfo[] {
+  const models = [...getEnvConfiguredAnthropicModels()]
+
+  if (models.length === 0) {
+    models.push(...DEFAULT_MODELS)
+  }
+
+  for (const model of getOpenAIAuthModels()) {
+    addUniqueModel(models, model)
+  }
+
+  return models
+}
+
+function normalizeEffortLevel(value: unknown): (typeof EFFORT_LEVELS)[number] {
+  return typeof value === 'string' && EFFORT_LEVELS.includes(value as (typeof EFFORT_LEVELS)[number])
+    ? value as (typeof EFFORT_LEVELS)[number]
+    : DEFAULT_EFFORT
+}
 
 // ─── Router ───────────────────────────────────────────────────────────────────
 
@@ -83,19 +191,13 @@ async function handleModelsList(): Promise<Response> {
   const { providers, activeId } = await providerService.listProviders()
   const activeProvider = activeId ? providers.find((p) => p.id === activeId) : null
   if (activeProvider) {
-    // Convert ModelMapping to model list for API compatibility
-    const modelList = [
-      { id: activeProvider.models.main, name: activeProvider.models.main, description: 'Main model', context: '' },
-      ...(activeProvider.models.haiku !== activeProvider.models.main ? [{ id: activeProvider.models.haiku, name: activeProvider.models.haiku, description: 'Haiku model', context: '' }] : []),
-      ...(activeProvider.models.sonnet !== activeProvider.models.main ? [{ id: activeProvider.models.sonnet, name: activeProvider.models.sonnet, description: 'Sonnet model', context: '' }] : []),
-      ...(activeProvider.models.opus !== activeProvider.models.main ? [{ id: activeProvider.models.opus, name: activeProvider.models.opus, description: 'Opus model', context: '' }] : []),
-    ]
+    const modelList = buildProviderModelList(activeProvider.models)
     return Response.json({
       models: modelList,
       provider: { id: activeProvider.id, name: activeProvider.name },
     })
   }
-  return Response.json({ models: DEFAULT_MODELS, provider: null })
+  return Response.json({ models: getStandaloneModelList(), provider: null })
 }
 
 async function handleCurrentModel(req: Request): Promise<Response> {
@@ -109,6 +211,7 @@ async function handleCurrentModel(req: Request): Promise<Response> {
     const explicitModel = (settings.model as string) || ''
     const contextTier = (settings.modelContext as string) || undefined
     const env = (settings.env as Record<string, string>) || {}
+    const envModel = process.env.ANTHROPIC_MODEL?.trim() || ''
 
     let currentModelId: string
     let currentModelName: string
@@ -127,7 +230,7 @@ async function handleCurrentModel(req: Request): Promise<Response> {
       }
     } else {
       // No provider — use settings model with context tier
-      currentModelId = explicitModel || DEFAULT_MODEL
+      currentModelId = explicitModel || envModel || DEFAULT_MODEL
       currentModelName = currentModelId
     }
 
@@ -135,13 +238,8 @@ async function handleCurrentModel(req: Request): Promise<Response> {
 
     // Build available models for name lookup
     const availableModels = activeProvider
-      ? [
-          { id: activeProvider.models.main, name: activeProvider.models.main, description: 'Main model', context: '' },
-          ...(activeProvider.models.haiku && activeProvider.models.haiku !== activeProvider.models.main ? [{ id: activeProvider.models.haiku, name: activeProvider.models.haiku, description: 'Haiku model', context: '' }] : []),
-          ...(activeProvider.models.sonnet && activeProvider.models.sonnet !== activeProvider.models.main ? [{ id: activeProvider.models.sonnet, name: activeProvider.models.sonnet, description: 'Sonnet model', context: '' }] : []),
-          ...(activeProvider.models.opus && activeProvider.models.opus !== activeProvider.models.main ? [{ id: activeProvider.models.opus, name: activeProvider.models.opus, description: 'Opus model', context: '' }] : []),
-        ]
-      : DEFAULT_MODELS
+      ? buildProviderModelList(activeProvider.models)
+      : getStandaloneModelList()
 
     const modelEntry = availableModels.find((m) => m.id === lookupId)
       || availableModels.find((m) => m.id === currentModelId)
@@ -190,7 +288,7 @@ async function handleCurrentModel(req: Request): Promise<Response> {
 async function handleEffort(req: Request): Promise<Response> {
   if (req.method === 'GET') {
     const settings = await settingsService.getUserSettings()
-    const level = (settings.effort as string) || DEFAULT_EFFORT
+    const level = normalizeEffortLevel(settings.effort)
     return Response.json({ level, available: EFFORT_LEVELS })
   }
 

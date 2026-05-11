@@ -2,6 +2,7 @@
 .env.*
 !.env.example
 node_modules
+openspec
 .DS_Store
 
 # Computer Use runtime (auto-generated)
@@ -22,6 +23,10 @@ extracted-natives/
 # E2E screenshots
 e2e-*.png
 
+# Quality gate reports
+artifacts/quality-runs/
+artifacts/coverage/
+
 # Desktop build output
 desktop/dist/
 desktop/build-artifacts/
@@ -38,6 +43,7 @@ desktop/brand-assets/
 
 # Superpowers plans & specs (local only)
 docs/superpowers/
+.superpowers/
 
 # Temp server/web logs
 .tmp-*.log
@@ -65,3 +71,6 @@ runtime/__pycache__
 
 # IDE
 .idea
+
+# Codex logs
+.codex-logs/

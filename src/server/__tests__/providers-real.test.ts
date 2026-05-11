@@ -66,8 +66,13 @@ describe('Real Provider Configs', () => {
     // 验证写入 cc-haha/settings.json
     const settings = await readCcHahaSettings()
     expect((settings.env as Record<string, string>).ANTHROPIC_BASE_URL).toBe('https://api.minimaxi.com/anthropic')
-    expect((settings.env as Record<string, string>).ANTHROPIC_API_KEY).toBe('sk-fake-test-key-for-testing-only')
+    expect((settings.env as Record<string, string>).ANTHROPIC_AUTH_TOKEN).toBe('sk-fake-test-key-for-testing-only')
+    expect((settings.env as Record<string, string>).ANTHROPIC_API_KEY).toBe('')
     expect((settings.env as Record<string, string>).ANTHROPIC_MODEL).toBe('MiniMax-M2.7-highspeed')
+    expect(JSON.parse((settings.env as Record<string, string>).CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toMatchObject({
+      'MiniMax-M2.7': 204800,
+      'MiniMax-M2.7-highspeed': 204800,
+    })
 
     // 验证原版 settings.json 没有被创建
     expect(await originalSettingsExists()).toBe(false)
@@ -101,13 +106,19 @@ describe('Real Provider Configs', () => {
     await service.activateProvider(minimax.id)
     let settings = await readCcHahaSettings()
     expect((settings.env as Record<string, string>).ANTHROPIC_BASE_URL).toBe('https://api.minimaxi.com/anthropic')
+    expect(JSON.parse((settings.env as Record<string, string>).CLAUDE_CODE_MODEL_CONTEXT_WINDOWS)).toMatchObject({
+      'MiniMax-M2.7': 204800,
+      'MiniMax-M2.7-highspeed': 204800,
+    })
 
     // 切换到接口AI中转站
     await service.activateProvider(jiekou.id)
     settings = await readCcHahaSettings()
     expect((settings.env as Record<string, string>).ANTHROPIC_BASE_URL).toBe('https://api.jiekou.ai/anthropic')
-    expect((settings.env as Record<string, string>).ANTHROPIC_API_KEY).toBe('sk-fake-test-key-for-testing-only')
+    expect((settings.env as Record<string, string>).ANTHROPIC_AUTH_TOKEN).toBe('sk-fake-test-key-for-testing-only')
+    expect((settings.env as Record<string, string>).ANTHROPIC_API_KEY).toBe('')
     expect((settings.env as Record<string, string>).ANTHROPIC_MODEL).toBe('claude-opus-4-7')
+    expect((settings.env as Record<string, string>).CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBeUndefined()
 
     // 验证 activeId 正确
     const list = await service.listProviders()
@@ -151,7 +162,8 @@ describe('Real Provider Configs', () => {
 
     // 验证新字段写入
     expect((settings.env as Record<string, string>).ANTHROPIC_BASE_URL).toBe('https://api.jiekou.ai/anthropic')
-    expect((settings.env as Record<string, string>).ANTHROPIC_API_KEY).toBe('sk_test')
+    expect((settings.env as Record<string, string>).ANTHROPIC_AUTH_TOKEN).toBe('sk_test')
+    expect((settings.env as Record<string, string>).ANTHROPIC_API_KEY).toBe('')
 
     // 验证已有字段保留
     expect(settings.customField).toBe('should_be_preserved')
@@ -182,6 +194,7 @@ describe('Real Provider Configs', () => {
     const env = settings.env as Record<string, string> | undefined
     expect(env?.ANTHROPIC_BASE_URL).toBeUndefined()
     expect(env?.ANTHROPIC_API_KEY).toBeUndefined()
+    expect(env?.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
     expect(env?.ANTHROPIC_MODEL).toBeUndefined()
 
     console.log('✅ activateOfficial 正确清除了 provider env')
@@ -192,6 +205,7 @@ describe('Real Provider Configs', () => {
       baseUrl: 'https://api.minimaxi.com/anthropic',
       apiKey: 'sk-fake-test-key',
       modelId: 'MiniMax-M2.7-highspeed',
+      authStrategy: 'auth_token',
     })
 
     // testProviderConfig 返回 { connectivity: { ... }, proxy?: { ... } }
@@ -237,7 +251,8 @@ describe('Real Provider Configs', () => {
     // 验证 cc-haha/settings.json 是 Haha 自己的
     const haha = await readCcHahaSettings()
     expect((haha.env as Record<string, string>).ANTHROPIC_BASE_URL).toBe('https://api.minimaxi.com/anthropic')
-    expect((haha.env as Record<string, string>).ANTHROPIC_API_KEY).toBe('sk-haha-key')
+    expect((haha.env as Record<string, string>).ANTHROPIC_AUTH_TOKEN).toBe('sk-haha-key')
+    expect((haha.env as Record<string, string>).ANTHROPIC_API_KEY).toBe('')
 
     console.log('✅ 原版 settings.json 完好无损，Haha 配置独立存储')
   })

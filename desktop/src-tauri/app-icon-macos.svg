@@ -27,6 +27,7 @@
     </linearGradient>
   </defs>
 
+  <g transform="translate(512 512) scale(1.0612244898) translate(-512 -512)">
   <rect x="120" y="120" width="784" height="784" rx="180" fill="url(#panel)"/>
   <rect x="124" y="124" width="776" height="776" rx="176" stroke="url(#panelGlow)" stroke-width="8"/>
   <path d="M236 260C324 190 464 170 612 206" stroke="#5C2E1D" stroke-width="18" stroke-linecap="round" opacity="0.58"/>
@@ -38,5 +39,6 @@
   <path d="M684 298H834V726H684" stroke="url(#accent)" stroke-width="64" stroke-linecap="round" stroke-linejoin="round"/>
   <g filter="url(#sparkGlow)">
     <path d="M592 334L608.8 385.2L660 402L608.8 418.8L592 470L575.2 418.8L524 402L575.2 385.2L592 334Z" fill="url(#spark)"/>
+  </g>
   </g>
 </svg>

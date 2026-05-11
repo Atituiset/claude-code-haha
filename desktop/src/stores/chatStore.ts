@@ -7,6 +7,8 @@ import { useCLITaskStore } from './cliTaskStore'
 import { useSessionRuntimeStore } from './sessionRuntimeStore'
 import { useTabStore } from './tabStore'
 import { randomSpinnerVerb } from '../config/spinnerVerbs'
+import { notifyDesktop } from '../lib/desktopNotifications'
+import { deriveSessionTitle, isPlaceholderSessionTitle } from '../lib/sessionTitle'
 import { AGENT_LIFECYCLE_TYPES } from '../types/team'
 import type { MessageEntry } from '../types/session'
 import type { PermissionMode } from '../types/settings'
@@ -92,7 +94,7 @@ type ChatStore = {
     sessionId: string,
     content: string,
     attachments?: AttachmentRef[],
-    options?: { displayContent?: string },
+    options?: { displayContent?: string; displayAttachments?: AttachmentRef[] },
   ) => void
   respondToPermission: (
     sessionId: string,
@@ -122,23 +124,60 @@ type ChatStore = {
 }
 
 const TASK_TOOL_NAMES = new Set(['TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList', 'TodoWrite'])
-const pendingTaskToolUseIds = new Set<string>()
+const pendingTaskToolUseIdsBySession = new Map<string, Set<string>>()
+
+function addPendingTaskToolUseId(sessionId: string, toolUseId: string): void {
+  const ids = pendingTaskToolUseIdsBySession.get(sessionId) ?? new Set<string>()
+  ids.add(toolUseId)
+  pendingTaskToolUseIdsBySession.set(sessionId, ids)
+}
+
+function consumePendingTaskToolUseId(sessionId: string, toolUseId: string): boolean {
+  const ids = pendingTaskToolUseIdsBySession.get(sessionId)
+  if (!ids?.has(toolUseId)) return false
+  ids.delete(toolUseId)
+  if (ids.size === 0) pendingTaskToolUseIdsBySession.delete(sessionId)
+  return true
+}
+
+function clearPendingTaskToolUseIds(sessionId: string): void {
+  pendingTaskToolUseIdsBySession.delete(sessionId)
+}
+const AGENT_COMPLETION_NOTIFICATION_PREVIEW_CHARS = 160
 
 let msgCounter = 0
 const nextId = () => `msg-${++msgCounter}-${Date.now()}`
 
-// Streaming throttle for content_delta
-let pendingDelta = ''
-let flushTimer: ReturnType<typeof setTimeout> | null = null
+// Streaming throttle for content_delta. Buffers must be per-session because
+// multiple desktop tabs can stream at the same time.
+const pendingDeltaBySession = new Map<string, string>()
+const flushTimerBySession = new Map<string, ReturnType<typeof setTimeout>>()
 
-function consumePendingDelta(): string {
+function consumePendingDelta(sessionId: string): string {
+  const flushTimer = flushTimerBySession.get(sessionId)
   if (flushTimer) {
     clearTimeout(flushTimer)
-    flushTimer = null
+    flushTimerBySession.delete(sessionId)
   }
-  const text = pendingDelta
-  pendingDelta = ''
+  const text = pendingDeltaBySession.get(sessionId) ?? ''
+  pendingDeltaBySession.delete(sessionId)
   return text
+}
+
+function appendPendingDelta(sessionId: string, text: string): void {
+  pendingDeltaBySession.set(
+    sessionId,
+    `${pendingDeltaBySession.get(sessionId) ?? ''}${text}`,
+  )
+}
+
+function clearPendingDelta(sessionId: string): void {
+  const flushTimer = flushTimerBySession.get(sessionId)
+  if (flushTimer) {
+    clearTimeout(flushTimer)
+    flushTimerBySession.delete(sessionId)
+  }
+  pendingDeltaBySession.delete(sessionId)
 }
 
 function appendAssistantTextMessage(
@@ -171,6 +210,34 @@ function appendAssistantTextMessage(
   ]
 }
 
+function normalizeNotificationPreview(content: string): string {
+  return content
+    .replace(/```[\s\S]*?```/g, ' code block ')
+    .replace(/!\[([^\]]*)\]\([^)]+\)/g, '$1')
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, '$1')
+    .replace(/`([^`]+)`/g, '$1')
+    .replace(/[*_~>#-]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function buildAgentCompletionNotification(
+  sessionId: string,
+  messages: UIMessage[],
+  text: string,
+): { title: string; body: string; dedupeKey: string } | null {
+  const preview = normalizeNotificationPreview(text)
+  if (!preview) return null
+
+  const lastAssistant = [...messages].reverse().find((message) => message.type === 'assistant_text')
+  const suffix = preview.length > AGENT_COMPLETION_NOTIFICATION_PREVIEW_CHARS ? '...' : ''
+  return {
+    title: 'Claude Code Haha 已完成回复',
+    body: preview.slice(0, AGENT_COMPLETION_NOTIFICATION_PREVIEW_CHARS) + suffix,
+    dedupeKey: `agent-completion:${sessionId}:${lastAssistant?.id ?? Date.now()}`,
+  }
+}
+
 /** Helper: immutably update a specific session within the sessions record */
 function updateSessionIn(
   sessions: Record<string, PerSessionState>,
@@ -183,11 +250,14 @@ function updateSessionIn(
 }
 
 async function fetchAndMapSessionHistory(sessionId: string) {
-  const { messages } = await sessionsApi.getMessages(sessionId)
+  const { messages, taskNotifications } = await sessionsApi.getMessages(sessionId)
   return {
     rawMessages: messages,
     uiMessages: mapHistoryMessagesToUiMessages(messages),
-    restoredNotifications: reconstructAgentNotifications(messages),
+    restoredNotifications: {
+      ...reconstructAgentNotifications(messages),
+      ...agentNotificationRecordFromList(taskNotifications ?? []),
+    },
     lastTodos: extractLastTodoWriteFromHistory(messages),
     hasMessagesAfterTaskCompletion: hasUserMessagesAfterTaskCompletion(messages),
   }
@@ -249,11 +319,11 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   disconnectSession: (sessionId) => {
     const session = get().sessions[sessionId]
     if (session?.elapsedTimer) clearInterval(session.elapsedTimer)
-    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null }
-    if (pendingDelta) {
-      const text = consumePendingDelta()
+    if (pendingDeltaBySession.has(sessionId)) {
+      const text = consumePendingDelta(sessionId)
       set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, (sess) => ({ streamingText: sess.streamingText + text })) }))
     }
+    clearPendingTaskToolUseIds(sessionId)
     wsManager.disconnect(sessionId)
     set((s) => {
       const { [sessionId]: _, ...rest } = s.sessions
@@ -264,34 +334,42 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   sendMessage: (sessionId, content, attachments, options) => {
     const userFacingContent =
       options?.displayContent?.trim() || content.trim()
+    const modelFacingContent = buildModelContent(content, attachments)
     const isMemberSession = !!useTeamStore.getState().getMemberBySessionId(sessionId)
+    const visibleAttachments = options?.displayAttachments ?? attachments
     const uiAttachments: UIAttachment[] | undefined =
-      attachments && attachments.length > 0
-        ? attachments.map((a) => ({
+      visibleAttachments && visibleAttachments.length > 0
+        ? visibleAttachments.map((a) => ({
             type: a.type,
             name: a.name || a.path || a.mimeType || a.type,
+            path: a.path,
             data: a.data,
             mimeType: a.mimeType,
+            lineStart: a.lineStart,
+            lineEnd: a.lineEnd,
+            note: a.note,
+            quote: a.quote,
           }))
         : undefined
 
     const taskStore = useCLITaskStore.getState()
-    const allTasksDone = taskStore.tasks.length > 0 && taskStore.tasks.every((t) => t.status === 'completed')
+    const sessionTasks = taskStore.sessionId === sessionId ? taskStore.tasks : []
+    const allTasksDone = sessionTasks.length > 0 && sessionTasks.every((t) => t.status === 'completed')
     const completedTaskSummary = allTasksDone
-      ? taskStore.tasks.map((t) => ({ id: t.id, subject: t.subject, status: t.status, activeForm: t.activeForm }))
+      ? sessionTasks.map((t) => ({ id: t.id, subject: t.subject, status: t.status, activeForm: t.activeForm }))
       : []
 
     if (!isMemberSession && allTasksDone) {
-      void taskStore.resetCompletedTasks()
+      void taskStore.resetCompletedTasks(sessionId)
+    }
+
+    if (!isMemberSession) {
+      updateOptimisticSessionTitle(sessionId, userFacingContent)
     }
 
     set((s) => {
       const session = s.sessions[sessionId] ?? createDefaultSessionState()
-      if (flushTimer) {
-        clearTimeout(flushTimer)
-        flushTimer = null
-      }
-      const bufferedDelta = consumePendingDelta()
+      const bufferedDelta = consumePendingDelta(sessionId)
       const pendingAssistantText = `${session.streamingText}${bufferedDelta}`
 
       const newMessages = pendingAssistantText.trim()
@@ -309,6 +387,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         id: nextId(),
         type: 'user_text',
         content: userFacingContent,
+        ...(userFacingContent !== modelFacingContent ? { modelContent: modelFacingContent } : {}),
         attachments: isMemberSession ? undefined : uiAttachments,
         timestamp: Date.now(),
         ...(isMemberSession ? { pending: true } : {}),
@@ -403,9 +482,8 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
   stopGeneration: (sessionId) => {
     wsManager.send(sessionId, { type: 'stop_generation' })
-    if (flushTimer) { clearTimeout(flushTimer); flushTimer = null }
-    if (pendingDelta) {
-      const text = consumePendingDelta()
+    if (pendingDeltaBySession.has(sessionId)) {
+      const text = consumePendingDelta(sessionId)
       set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, (sess) => ({ streamingText: sess.streamingText + text })) }))
     }
     set((s) => {
@@ -445,12 +523,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       })
       if (lastTodos && lastTodos.length > 0) {
         const taskStore = useCLITaskStore.getState()
-        if (taskStore.tasks.length === 0) taskStore.setTasksFromTodos(lastTodos)
+        if (taskStore.sessionId === sessionId && taskStore.tasks.length === 0) taskStore.setTasksFromTodos(lastTodos, sessionId)
       } else {
-        useCLITaskStore.getState().setTasksFromTodos([])
+        useCLITaskStore.getState().setTasksFromTodos([], sessionId)
       }
       if (hasMessagesAfterTaskCompletion) {
-        useCLITaskStore.getState().markCompletedAndDismissed()
+        useCLITaskStore.getState().markCompletedAndDismissed(sessionId)
       }
     } catch {
       // Session may not have messages yet
@@ -489,12 +567,12 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       })
 
       if (lastTodos && lastTodos.length > 0) {
-        useCLITaskStore.getState().setTasksFromTodos(lastTodos)
+        useCLITaskStore.getState().setTasksFromTodos(lastTodos, sessionId)
       } else {
-        useCLITaskStore.getState().setTasksFromTodos([])
+        useCLITaskStore.getState().setTasksFromTodos([], sessionId)
       }
       if (hasMessagesAfterTaskCompletion) {
-        useCLITaskStore.getState().markCompletedAndDismissed()
+        useCLITaskStore.getState().markCompletedAndDismissed(sessionId)
       }
     } catch {
       // Session may not have messages yet
@@ -514,6 +592,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 
   clearMessages: (sessionId) => {
+    clearPendingTaskToolUseIds(sessionId)
     set((s) => ({ sessions: updateSessionIn(s.sessions, sessionId, () => ({ messages: [], streamingText: '', chatState: 'idle' })) }))
   },
 
@@ -528,7 +607,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
       case 'status':
         update((session) => {
-          const pendingText = `${session.streamingText}${consumePendingDelta()}`
+          const pendingText = `${session.streamingText}${consumePendingDelta(sessionId)}`
           const hasPendingStreamText =
             session.chatState === 'streaming' && pendingText.trim().length > 0
           // Background task progress can arrive while the assistant is still
@@ -562,7 +641,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       case 'content_start': {
         const session = get().sessions[sessionId]
         if (!session) break
-        const pendingText = `${session.streamingText}${consumePendingDelta()}`
+        const pendingText = `${session.streamingText}${consumePendingDelta(sessionId)}`
         if (msg.blockType !== 'text' && pendingText.trim()) {
           update((s) => ({
             messages: appendAssistantTextMessage(s.messages, pendingText, Date.now()),
@@ -589,14 +668,16 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
       case 'content_delta':
         if (msg.text !== undefined) {
-          pendingDelta += msg.text
-          if (!flushTimer) {
-            flushTimer = setTimeout(() => {
-              const text = pendingDelta
-              pendingDelta = ''
-              flushTimer = null
+          if (!get().sessions[sessionId]) break
+          appendPendingDelta(sessionId, msg.text)
+          if (!flushTimerBySession.has(sessionId)) {
+            const timer = setTimeout(() => {
+              const text = pendingDeltaBySession.get(sessionId) ?? ''
+              pendingDeltaBySession.delete(sessionId)
+              flushTimerBySession.delete(sessionId)
               update((s) => ({ streamingText: s.streamingText + text }))
             }, 50)
+            flushTimerBySession.set(sessionId, timer)
           }
         }
         if (msg.toolInput !== undefined) update((s) => ({ streamingToolInput: s.streamingToolInput + msg.toolInput }))
@@ -604,7 +685,7 @@ export const useChatStore = create<ChatStore>((set, get) => ({
 
       case 'thinking':
         update((s) => {
-          const pendingText = `${s.streamingText}${consumePendingDelta()}`
+          const pendingText = `${s.streamingText}${consumePendingDelta(sessionId)}`
           const base = pendingText.trim()
             ? appendAssistantTextMessage(s.messages, pendingText, Date.now())
             : s.messages
@@ -636,10 +717,10 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           activeToolUseId: null, activeToolName: null, activeThinkingId: null, streamingToolInput: '',
         }))
         if (toolName === 'TodoWrite' && Array.isArray((msg.input as any)?.todos)) {
-          useCLITaskStore.getState().setTasksFromTodos((msg.input as any).todos)
+          useCLITaskStore.getState().setTasksFromTodos((msg.input as any).todos, sessionId)
         } else if (TASK_TOOL_NAMES.has(toolName)) {
           const useId = msg.toolUseId || session?.activeToolUseId
-          if (useId) pendingTaskToolUseIds.add(useId)
+          if (useId) addPendingTaskToolUseId(sessionId, useId)
         }
         break
       }
@@ -652,13 +733,22 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           }],
           chatState: 'thinking', activeThinkingId: null,
         }))
-        if (pendingTaskToolUseIds.has(msg.toolUseId)) {
-          pendingTaskToolUseIds.delete(msg.toolUseId)
-          useCLITaskStore.getState().refreshTasks()
+        if (consumePendingTaskToolUseId(sessionId, msg.toolUseId)) {
+          useCLITaskStore.getState().refreshTasks(sessionId)
         }
         break
 
       case 'permission_request':
+        notifyDesktop({
+          dedupeKey: `permission:${msg.requestId}`,
+          cooldownScope: 'permission-prompt',
+          requestAttention: true,
+          title: 'Claude Code Haha 需要你的确认',
+          body: msg.toolName
+            ? `${msg.toolName} 请求执行，正在等待允许。`
+            : '有一个工具请求正在等待允许。',
+          target: { type: 'session', sessionId },
+        })
         update((s) => ({
           pendingPermission: {
             requestId: msg.requestId,
@@ -687,6 +777,14 @@ export const useChatStore = create<ChatStore>((set, get) => ({
         break
 
       case 'computer_use_permission_request':
+        notifyDesktop({
+          dedupeKey: `computer-use-permission:${msg.requestId}`,
+          cooldownScope: 'permission-prompt',
+          requestAttention: true,
+          title: 'Claude Code Haha 需要你的确认',
+          body: msg.request.reason || 'Computer Use 正在等待允许。',
+          target: { type: 'session', sessionId },
+        })
         update(() => ({
           pendingComputerUsePermission: {
             requestId: msg.requestId,
@@ -701,10 +799,13 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       case 'message_complete': {
         const session = get().sessions[sessionId]
         if (!session) break
-        const text = `${session.streamingText}${consumePendingDelta()}`
+        const wasAgentRunning = session.chatState !== 'idle'
+        const text = `${session.streamingText}${consumePendingDelta(sessionId)}`
+        let completionMessages = session.messages
         if (text.trim()) {
-          update((s) => ({
-            messages: appendAssistantTextMessage(s.messages, text, Date.now()),
+          completionMessages = appendAssistantTextMessage(session.messages, text, Date.now())
+          update(() => ({
+            messages: completionMessages,
             streamingText: '',
           }))
         } else if (text !== session.streamingText) {
@@ -719,12 +820,24 @@ export const useChatStore = create<ChatStore>((set, get) => ({
           pendingComputerUsePermission: null,
           elapsedTimer: null,
         }))
+        const notification = wasAgentRunning
+          ? buildAgentCompletionNotification(sessionId, completionMessages, text)
+          : null
+        if (notification) {
+          void notifyDesktop({
+            dedupeKey: notification.dedupeKey,
+            cooldownScope: 'agent-completion',
+            title: notification.title,
+            body: notification.body,
+            target: { type: 'session', sessionId },
+          })
+        }
         break
       }
 
       case 'error':
         update((s) => {
-          const pendingText = `${s.streamingText}${consumePendingDelta()}`
+          const pendingText = `${s.streamingText}${consumePendingDelta(sessionId)}`
           let newMessages = s.messages
           if (pendingText.trim()) {
             newMessages = appendAssistantTextMessage(newMessages, pendingText, Date.now())
@@ -767,6 +880,47 @@ export const useChatStore = create<ChatStore>((set, get) => ({
       case 'system_notification':
         if (msg.subtype === 'slash_commands' && Array.isArray(msg.data)) {
           update(() => ({ slashCommands: msg.data as Array<{ name: string; description: string }> }))
+        }
+        if (msg.subtype === 'session_cleared') {
+          const session = get().sessions[sessionId]
+          if (session?.elapsedTimer) clearInterval(session.elapsedTimer)
+          update(() => ({
+            messages: [],
+            streamingText: '',
+            streamingToolInput: '',
+            activeToolUseId: null,
+            activeToolName: null,
+            activeThinkingId: null,
+            pendingPermission: null,
+            pendingComputerUsePermission: null,
+            chatState: 'idle',
+            elapsedTimer: null,
+            elapsedSeconds: 0,
+            statusVerb: '',
+            tokenUsage: { input_tokens: 0, output_tokens: 0 },
+            slashCommands: [],
+          }))
+          clearPendingDelta(sessionId)
+          clearPendingTaskToolUseIds(sessionId)
+          useCLITaskStore.getState().clearTasks(sessionId)
+          useSessionStore.getState().updateSessionTitle(sessionId, 'New Session')
+          useTabStore.getState().updateTabTitle(sessionId, 'New Session')
+          useTabStore.getState().updateTabStatus(sessionId, 'idle')
+        }
+        if (msg.subtype === 'compact_boundary') {
+          update((session) => ({
+            messages: [
+              ...session.messages,
+              {
+                id: nextId(),
+                type: 'system',
+                content: typeof msg.message === 'string' && msg.message.trim()
+                  ? msg.message
+                  : 'Context compacted',
+                timestamp: Date.now(),
+              },
+            ],
+          }))
         }
         if (msg.subtype === 'task_notification' && msg.data && typeof msg.data === 'object') {
           const data = msg.data as Record<string, unknown>
@@ -811,10 +965,23 @@ export const useChatStore = create<ChatStore>((set, get) => ({
   },
 }))
 
+function updateOptimisticSessionTitle(sessionId: string, content: string): void {
+  const title = deriveSessionTitle(content)
+  if (!title) return
+
+  const session = useSessionStore.getState().sessions.find((item) => item.id === sessionId)
+  if (!session || session.messageCount > 0 || !isPlaceholderSessionTitle(session.title)) return
+
+  useSessionStore.getState().updateSessionTitle(sessionId, title)
+  useTabStore.getState().updateTabTitle(sessionId, title)
+}
+
 // ─── History mapping helpers (unchanged from original) ─────────
 
 type AssistantHistoryBlock = { type: string; text?: string; thinking?: string; name?: string; id?: string; input?: unknown }
 type UserHistoryBlock = { type: string; text?: string; tool_use_id?: string; content?: unknown; is_error?: boolean; source?: { data?: string }; mimeType?: string; media_type?: string; name?: string }
+
+const TASK_NOTIFICATION_RE = /^<task-notification>\s*[\s\S]*<\/task-notification>$/i
 
 /**
  * Check if text is a teammate-message (internal agent-to-agent communication).
@@ -823,6 +990,82 @@ type UserHistoryBlock = { type: string; text?: string; tool_use_id?: string; con
  */
 function isTeammateMessage(text: string): boolean {
   return text.includes('<teammate-message') && text.includes('</teammate-message>')
+}
+
+function extractHistoryTextBlocks(content: unknown): string[] {
+  if (typeof content === 'string') return [content]
+  if (!Array.isArray(content)) return []
+
+  return content
+    .flatMap((block) => {
+      if (!block || typeof block !== 'object') return []
+      const record = block as Record<string, unknown>
+      return record.type === 'text' && typeof record.text === 'string'
+        ? [record.text]
+        : []
+    })
+    .map((text) => text.trim())
+    .filter(Boolean)
+}
+
+function isTaskNotificationContent(content: unknown): boolean {
+  const textBlocks = extractHistoryTextBlocks(content)
+  return textBlocks.length > 0 && textBlocks.every((text) => extractTaskNotificationXml(text) !== null)
+}
+
+function extractTaskNotificationXml(text: string): string | null {
+  const trimmed = text.trim()
+  if (TASK_NOTIFICATION_RE.test(trimmed)) return trimmed
+  return trimmed.match(/<task-notification>\s*[\s\S]*?<\/task-notification>/i)?.[0] ?? null
+}
+
+function decodeXmlText(text: string): string {
+  return text
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+function readXmlTag(xml: string, tag: string): string | undefined {
+  const match = xml.match(new RegExp(`<${tag}>([\\s\\S]*?)<\\/${tag}>`, 'i'))
+  return match?.[1] ? decodeXmlText(match[1].trim()) : undefined
+}
+
+function extractTaskNotification(content: unknown): AgentTaskNotification | null {
+  const xml = extractHistoryTextBlocks(content)
+    .map((text) => extractTaskNotificationXml(text))
+    .find((value): value is string => value !== null)
+  if (!xml) return null
+
+  const toolUseId = readXmlTag(xml, 'tool-use-id')
+  const status = readXmlTag(xml, 'status')
+  if (
+    !toolUseId ||
+    (status !== 'completed' && status !== 'failed' && status !== 'stopped')
+  ) {
+    return null
+  }
+
+  const taskId = readXmlTag(xml, 'task-id') || toolUseId
+  const summary = readXmlTag(xml, 'summary')
+  const outputFile = readXmlTag(xml, 'output-file')
+  return {
+    taskId,
+    toolUseId,
+    status,
+    ...(summary ? { summary } : {}),
+    ...(outputFile ? { outputFile } : {}),
+  }
+}
+
+function agentNotificationRecordFromList(
+  notifications: AgentTaskNotification[],
+): Record<string, AgentTaskNotification> {
+  return Object.fromEntries(
+    notifications.map((notification) => [notification.toolUseId, notification]),
+  )
 }
 
 const TEAMMATE_CONTENT_REGEX = /<teammate-message\s+teammate_id="([^"]+)"[^>]*>\n?([\s\S]*?)\n?<\/teammate-message>/g
@@ -879,6 +1122,53 @@ type HistoryMappingOptions = {
   includeTeammateMessages?: boolean
 }
 
+function buildModelContent(content: string, attachments?: AttachmentRef[]): string {
+  const paths = attachments
+    ?.map((attachment) => attachment.path)
+    .filter((path): path is string => typeof path === 'string' && path.length > 0) ?? []
+  const trimmed = content.trim()
+  if (paths.length === 0) return trimmed
+  const prefix = paths.map((path) => `@"${path}"`).join(' ')
+  return `${prefix} ${trimmed || 'Please analyze the attached files.'}`.trim()
+}
+
+function getReferenceName(referencePath: string): string {
+  const normalized = referencePath.replace(/\\/g, '/').replace(/\/+$/, '')
+  const name = normalized.split('/').filter(Boolean).pop()
+  return name || referencePath
+}
+
+function extractLeadingFileReferences(text: string): {
+  content: string
+  attachments?: UIAttachment[]
+  modelContent?: string
+} {
+  const attachments: UIAttachment[] = []
+  let remaining = text
+
+  while (true) {
+    const match = remaining.match(/^@"([^"]+)"\s*/)
+    if (!match?.[1]) break
+
+    attachments.push({
+      type: 'file',
+      name: getReferenceName(match[1]),
+      path: match[1],
+    })
+    remaining = remaining.slice(match[0].length)
+  }
+
+  if (attachments.length === 0) {
+    return { content: text }
+  }
+
+  return {
+    content: remaining.trimStart(),
+    attachments,
+    modelContent: text,
+  }
+}
+
 /**
  * Reconstruct agentTaskNotifications from history.
  *
@@ -888,6 +1178,11 @@ type HistoryMappingOptions = {
  * teammate_ids found in subsequent user messages.
  */
 export function reconstructAgentNotifications(messages: MessageEntry[]): Record<string, AgentTaskNotification> {
+  const taskNotifications = messages
+    .filter((message) => message.type === 'user')
+    .map((message) => extractTaskNotification(message.content))
+    .filter((notification): notification is AgentTaskNotification => notification !== null)
+
   // Step 1: Collect Agent tool_use blocks → map agent name to toolUseId
   const agentNameToToolUseId = new Map<string, string>()
 
@@ -904,7 +1199,9 @@ export function reconstructAgentNotifications(messages: MessageEntry[]): Record<
     }
   }
 
-  if (agentNameToToolUseId.size === 0) return {}
+  if (agentNameToToolUseId.size === 0) {
+    return agentNotificationRecordFromList(taskNotifications)
+  }
 
   // Step 2: Extract <teammate-message> content by teammate_id
   // Skip lifecycle messages (shutdown_approved, idle_notification, etc.)
@@ -950,6 +1247,10 @@ export function reconstructAgentNotifications(messages: MessageEntry[]): Record<
     }
   }
 
+  for (const notification of taskNotifications) {
+    notifications[notification.toolUseId] = notification
+  }
+
   return notifications
 }
 
@@ -959,7 +1260,19 @@ export function mapHistoryMessagesToUiMessages(
 ): UIMessage[] {
   const includeTeammateMessages = options?.includeTeammateMessages === true
   const uiMessages: UIMessage[] = []
+  let suppressTaskNotificationResponse = false
+
   for (const msg of messages) {
+    if (msg.type === 'user' && isTaskNotificationContent(msg.content)) {
+      suppressTaskNotificationResponse = true
+      continue
+    }
+    if (msg.type === 'user') {
+      suppressTaskNotificationResponse = false
+    } else if (suppressTaskNotificationResponse) {
+      continue
+    }
+
     const timestamp = new Date(msg.timestamp).getTime()
     if (msg.type === 'user' && typeof msg.content === 'string') {
       if (isTeammateMessage(msg.content)) {
@@ -974,10 +1287,19 @@ export function mapHistoryMessagesToUiMessages(
         })
         continue
       }
-      uiMessages.push({ id: msg.id || nextId(), type: 'user_text', content: msg.content, timestamp })
+      const parsed = extractLeadingFileReferences(msg.content)
+      uiMessages.push({
+        id: msg.id || nextId(),
+        type: 'user_text',
+        content: parsed.content,
+        ...(parsed.modelContent ? { modelContent: parsed.modelContent } : {}),
+        ...(parsed.attachments ? { attachments: parsed.attachments } : {}),
+        timestamp,
+      })
       continue
     }
     if (msg.type === 'assistant' && typeof msg.content === 'string') {
+      if (!msg.content.trim()) continue
       uiMessages.push({ id: msg.id || nextId(), type: 'assistant_text', content: msg.content, timestamp, model: msg.model })
       continue
     }
@@ -1004,7 +1326,16 @@ export function mapHistoryMessagesToUiMessages(
         else if (block.type === 'tool_result') uiMessages.push({ id: nextId(), type: 'tool_result', toolUseId: block.tool_use_id ?? '', content: block.content, isError: !!block.is_error, timestamp, parentToolUseId: msg.parentToolUseId })
       }
       if (textParts.length > 0 || attachments.length > 0) {
-        uiMessages.push({ id: nextId(), type: 'user_text', content: textParts.join('\n'), attachments: attachments.length > 0 ? attachments : undefined, timestamp })
+        const parsed = extractLeadingFileReferences(textParts.join('\n'))
+        const allAttachments = [...(parsed.attachments ?? []), ...attachments]
+        uiMessages.push({
+          id: msg.id || nextId(),
+          type: 'user_text',
+          content: parsed.content,
+          ...(parsed.modelContent ? { modelContent: parsed.modelContent } : {}),
+          attachments: allAttachments.length > 0 ? allAttachments : undefined,
+          timestamp,
+        })
       }
     }
   }

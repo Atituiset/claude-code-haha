@@ -13,7 +13,7 @@ import { ApiError } from '../middleware/errorHandler.js'
 
 export type TaskNotificationConfig = {
   enabled: boolean
-  channels: ('telegram' | 'feishu')[]
+  channels: ('desktop' | 'telegram' | 'feishu')[]
 }
 
 export type CronTask = {
@@ -29,6 +29,7 @@ export type CronTask = {
   permanent?: boolean
   permissionMode?: string
   model?: string
+  providerId?: string | null
   folderPath?: string
   useWorktree?: boolean
   notification?: TaskNotificationConfig

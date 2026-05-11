@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it } from 'bun:test'
 import * as fs from 'fs'
 import * as fsp from 'fs/promises'
+import * as os from 'os'
 import * as path from 'path'
 import { handleFilesystemRoute } from '../api/filesystem.js'
 
@@ -23,7 +24,7 @@ afterEach(async () => {
 
 describe('filesystem API', () => {
   it('allows browsing a directory under the user home directory', async () => {
-    const homeFixtureDir = await fsp.mkdtemp(path.join(process.env.HOME || path.sep, 'claude-filesystem-test-'))
+    const homeFixtureDir = await fsp.mkdtemp(path.join(os.homedir(), 'claude-filesystem-test-'))
     cleanupDirs.add(homeFixtureDir)
     await fsp.writeFile(path.join(homeFixtureDir, 'note.txt'), 'hello')
 

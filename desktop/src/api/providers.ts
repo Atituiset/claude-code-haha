@@ -61,7 +61,7 @@ export const providersApi = {
     return api.post<{ ok: true }>('/api/providers/official')
   },
 
-  test(id: string, overrides?: { baseUrl?: string; modelId?: string; apiFormat?: string }) {
+  test(id: string, overrides?: { baseUrl?: string; modelId?: string; apiFormat?: string; authStrategy?: string }) {
     return api.post<TestResultResponse>(`/api/providers/${id}/test`, overrides)
   },
 

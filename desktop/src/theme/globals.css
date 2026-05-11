@@ -173,6 +173,29 @@
   --color-surface-sidebar: var(--color-surface-container-low);
   --color-surface-hover: var(--color-surface-container-high);
   --color-surface-selected: var(--color-surface-container);
+  --color-model-option-selected-bg: var(--color-primary-fixed);
+  --color-model-option-selected-border: rgba(143, 72, 47, 0.2);
+  --color-inspector-surface: #FBFAF6;
+  --color-inspector-panel: #F4F2ED;
+  --color-inspector-chip: #EBE7DF;
+  --color-inspector-border: #D8B3A8;
+  --color-inspector-accent: #8F3217;
+  --color-inspector-accent-hover: #5B1E0D;
+  --color-inspector-accent-secondary: #0F5C8F;
+  --color-inspector-text: #1F1713;
+  --color-inspector-heading: #2B1B15;
+  --color-inspector-muted: #7B665F;
+  --color-inspector-muted-strong: #5F514C;
+  --color-inspector-success: #25451B;
+  --color-inspector-success-bg: #D8F2B6;
+  --color-inspector-danger: #C51616;
+  --color-inspector-danger-bg: #FFD9D3;
+  --color-inspector-danger-surface: #FFF7F5;
+  --color-inspector-danger-border: #F1B8B0;
+  --color-inspector-capacity: #9B928C;
+  --shadow-inspector: 0 28px 80px rgba(65, 54, 48, 0.22);
+  --color-switch-checked-bg: #90C1F7;
+  --color-switch-thumb: #FFFFFF;
   --color-sidebar-filter-bg: transparent;
   --color-sidebar-filter-border: rgba(218, 193, 186, 0.92);
   --color-sidebar-filter-icon-bg: transparent;
@@ -317,6 +340,29 @@
   --color-surface-sidebar: #171615;
   --color-surface-hover: var(--color-surface-container-highest);
   --color-surface-selected: var(--color-surface-container);
+  --color-model-option-selected-bg: rgba(255, 181, 159, 0.13);
+  --color-model-option-selected-border: rgba(255, 181, 159, 0.34);
+  --color-inspector-surface: #131211;
+  --color-inspector-panel: #1C1B1B;
+  --color-inspector-chip: #252120;
+  --color-inspector-border: rgba(255, 181, 159, 0.18);
+  --color-inspector-accent: #FFB59F;
+  --color-inspector-accent-hover: #FFD4C8;
+  --color-inspector-accent-secondary: #74E0F7;
+  --color-inspector-text: #E5E2E1;
+  --color-inspector-heading: #F3D6CC;
+  --color-inspector-muted: #A89A95;
+  --color-inspector-muted-strong: #C5B8B2;
+  --color-inspector-success: #7EDB8B;
+  --color-inspector-success-bg: rgba(126, 219, 139, 0.16);
+  --color-inspector-danger: #FFB4AB;
+  --color-inspector-danger-bg: rgba(255, 180, 171, 0.16);
+  --color-inspector-danger-surface: rgba(255, 180, 171, 0.08);
+  --color-inspector-danger-border: rgba(255, 180, 171, 0.22);
+  --color-inspector-capacity: #8F8683;
+  --shadow-inspector: 0 28px 80px rgba(0, 0, 0, 0.58);
+  --color-switch-checked-bg: rgba(116, 224, 247, 0.36);
+  --color-switch-thumb: #E5E2E1;
   --color-sidebar-filter-bg: rgba(255, 255, 255, 0.01);
   --color-sidebar-filter-border: rgba(255, 255, 255, 0.08);
   --color-sidebar-filter-icon-bg: transparent;
@@ -470,6 +516,23 @@ button, input, textarea, select, a, [role="button"] {
   box-shadow: var(--shadow-focus-ring), var(--shadow-dropdown);
 }
 
+.app-shell-viewport {
+  min-height: 100vh;
+  min-height: 100dvh;
+  height: 100vh;
+  height: 100dvh;
+}
+
+.app-shell {
+  position: relative;
+  width: 100%;
+  overflow-x: hidden;
+}
+
+.app-shell-backdrop {
+  background: var(--color-overlay-scrim);
+}
+
 .sidebar-shell {
   width: var(--sidebar-width);
   flex-shrink: 0;
@@ -480,6 +543,28 @@ button, input, textarea, select, a, [role="button"] {
 
 .sidebar-shell[data-state="closed"] {
   width: var(--sidebar-rail-width);
+}
+
+.app-shell--mobile .sidebar-shell {
+  position: fixed;
+  inset: 0 auto 0 0;
+  z-index: 50;
+  width: min(88vw, var(--sidebar-width));
+  max-width: var(--sidebar-width);
+  overflow: visible;
+  transform: translateX(-100%);
+  transition:
+    transform var(--motion-sidebar-duration) var(--motion-sidebar-easing),
+    width var(--motion-sidebar-duration) var(--motion-sidebar-easing);
+}
+
+.app-shell--mobile .sidebar-shell[data-state="closed"] {
+  pointer-events: none;
+}
+
+.app-shell--mobile .sidebar-shell[data-state="open"] {
+  transform: translateX(0);
+  pointer-events: auto;
 }
 
 .sidebar-panel {
@@ -495,6 +580,13 @@ button, input, textarea, select, a, [role="button"] {
 .sidebar-panel[data-state="closed"] {
   width: var(--sidebar-rail-width);
   min-width: var(--sidebar-rail-width);
+}
+
+.app-shell--mobile .sidebar-panel,
+.app-shell--mobile .sidebar-panel[data-state="closed"] {
+  width: min(88vw, var(--sidebar-width));
+  min-width: min(88vw, var(--sidebar-width));
+  box-shadow: var(--shadow-dropdown);
 }
 
 .sidebar-toggle-button {
@@ -614,6 +706,14 @@ button, input, textarea, select, a, [role="button"] {
   .sidebar-copy,
   .sidebar-section {
     transition-duration: 0.01ms !important;
+  }
+}
+
+@media (max-width: 767px) {
+  .app-shell-main--mobile {
+    width: 100%;
+    min-width: 0;
+    overflow-x: hidden;
   }
 }
 

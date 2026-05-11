@@ -24,20 +24,9 @@ import {
   TestProviderSchema,
 } from '../types/provider.js'
 import { ApiError, errorResponse } from '../middleware/errorHandler.js'
+import { diagnosticsService } from '../services/diagnosticsService.js'
 
 const providerService = new ProviderService()
-
-function maskApiKey(key: string): string {
-  if (key.length <= 8) return '****'
-  return key.slice(0, 4) + '****' + key.slice(-4)
-}
-
-function sanitizeProvider(provider: Record<string, unknown>): Record<string, unknown> {
-  if (typeof provider.apiKey === 'string') {
-    return { ...provider, apiKey: maskApiKey(provider.apiKey) }
-  }
-  return provider
-}
 
 export async function handleProvidersApi(
   req: Request,
@@ -87,7 +76,7 @@ export async function handleProvidersApi(
     if (!id) {
       if (req.method === 'GET') {
         const { providers, activeId } = await providerService.listProviders()
-        return Response.json({ providers: providers.map(sanitizeProvider), activeId })
+        return Response.json({ providers, activeId })
       }
       if (req.method === 'POST') {
         return await handleCreate(req)
@@ -105,19 +94,34 @@ export async function handleProvidersApi(
     // /api/providers/:id/test
     if (action === 'test') {
       if (req.method !== 'POST') throw methodNotAllowed(req.method)
-      let overrides: { baseUrl?: string; modelId?: string; apiFormat?: string } | undefined
+      let overrides: { baseUrl?: string; modelId?: string; apiFormat?: string; authStrategy?: string } | undefined
       try {
         const body = await req.json()
         if (body && typeof body === 'object') overrides = body as typeof overrides
       } catch { /* no body is fine — uses saved values */ }
       const result = await providerService.testProvider(id, overrides)
+      if (!result.connectivity.success || result.proxy?.success === false) {
+        void diagnosticsService.recordEvent({
+          type: 'provider_test_failed',
+          severity: 'warn',
+          summary: result.connectivity.error || result.proxy?.error || 'Provider test failed',
+          details: {
+            providerId: id,
+            httpStatus: result.connectivity.httpStatus ?? result.proxy?.httpStatus,
+            apiFormat: overrides?.apiFormat,
+            modelId: overrides?.modelId,
+            connectivity: result.connectivity,
+            proxy: result.proxy,
+          },
+        })
+      }
       return Response.json({ result })
     }
 
     // /api/providers/:id
     if (req.method === 'GET') {
       const provider = await providerService.getProvider(id)
-      return Response.json({ provider: sanitizeProvider(provider) })
+      return Response.json({ provider })
     }
     if (req.method === 'PUT') {
       return await handleUpdate(req, id)
@@ -162,8 +166,31 @@ async function handleTestUnsaved(req: Request): Promise<Response> {
   try {
     const input = TestProviderSchema.parse(body)
     const result = await providerService.testProviderConfig(input)
+    if (!result.connectivity.success || result.proxy?.success === false) {
+      void diagnosticsService.recordEvent({
+        type: 'provider_test_failed',
+        severity: 'warn',
+        summary: result.connectivity.error || result.proxy?.error || 'Provider test failed',
+        details: {
+          providerId: null,
+          baseUrl: input.baseUrl,
+          apiFormat: input.apiFormat,
+          modelId: input.modelId,
+          connectivity: result.connectivity,
+          proxy: result.proxy,
+        },
+      })
+    }
     return Response.json({ result })
   } catch (err) {
+    if (!(err instanceof z.ZodError)) {
+      void diagnosticsService.recordEvent({
+        type: 'provider_test_failed',
+        severity: 'warn',
+        summary: err instanceof Error ? err.message : String(err),
+        details: { providerId: null, error: err },
+      })
+    }
     if (err instanceof z.ZodError) throw ApiError.badRequest(err.issues.map((i) => i.message).join('; '))
     throw err
   }

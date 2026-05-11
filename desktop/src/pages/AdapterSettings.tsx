@@ -5,12 +5,27 @@ import { Input } from '../components/shared/Input'
 import { Button } from '../components/shared/Button'
 import { DirectoryPicker } from '../components/shared/DirectoryPicker'
 import { ConfirmDialog } from '../components/shared/ConfirmDialog'
+import QRCode from 'qrcode'
 
-type ImTab = 'feishu' | 'telegram'
+type ImTab = 'feishu' | 'wechat' | 'dingtalk' | 'telegram'
+type ImPlatform = 'telegram' | 'feishu' | 'wechat' | 'dingtalk'
 
 export function AdapterSettings() {
   const t = useTranslation()
-  const { config, isLoading, fetchConfig, updateConfig, generatePairingCode, removePairedUser } = useAdapterStore()
+  const {
+    config,
+    isLoading,
+    fetchConfig,
+    updateConfig,
+    generatePairingCode,
+    startWechatLogin,
+    pollWechatLogin,
+    removePairedUser,
+    beginDingtalkRegistration,
+    pollDingtalkRegistration,
+    unbindWechatAccount,
+    unbindDingtalkBot,
+  } = useAdapterStore()
 
   // Active IM tab —— Feishu 默认展示，在前
   const [activeIm, setActiveIm] = useState<ImTab>('feishu')
@@ -31,6 +46,32 @@ export function AdapterSettings() {
   const [fsAllowedUsers, setFsAllowedUsers] = useState('')
   const [fsStreamingCard, setFsStreamingCard] = useState(false)
 
+  // WeChat
+  const [wcAllowedUsers, setWcAllowedUsers] = useState('')
+  const [wechatQrUrl, setWechatQrUrl] = useState<string | null>(null)
+  const [wechatSessionKey, setWechatSessionKey] = useState<string | null>(null)
+  const [wechatStatus, setWechatStatus] = useState('')
+  const [isWechatBinding, setIsWechatBinding] = useState(false)
+  const [isUnbindingWechatAccount, setIsUnbindingWechatAccount] = useState(false)
+
+  // DingTalk
+  const [dtClientId, setDtClientId] = useState('')
+  const [dtClientSecret, setDtClientSecret] = useState('')
+  const [dtAllowedUsers, setDtAllowedUsers] = useState('')
+  const [dtEndpoint, setDtEndpoint] = useState('')
+  const [dtPermissionCardTemplateId, setDtPermissionCardTemplateId] = useState('')
+  const [dtRegistration, setDtRegistration] = useState<{
+    deviceCode: string
+    verificationUriComplete: string
+    qrDataUrl?: string
+    intervalSeconds: number
+    expiresAt: number
+  } | null>(null)
+  const [dtAuthStatus, setDtAuthStatus] = useState<'idle' | 'waiting' | 'bound' | 'error'>('idle')
+  const [dtAuthError, setDtAuthError] = useState('')
+  const [isStartingDtAuth, setIsStartingDtAuth] = useState(false)
+  const [isUnbindingDtBot, setIsUnbindingDtBot] = useState(false)
+
   const [isSaving, setIsSaving] = useState(false)
   const [saveStatus, setSaveStatus] = useState<'idle' | 'saved' | 'error'>('idle')
   const [saveError, setSaveError] = useState('')
@@ -38,7 +79,7 @@ export function AdapterSettings() {
   // Pairing
   const [pairingCode, setPairingCode] = useState<string | null>(null)
   const [isGenerating, setIsGenerating] = useState(false)
-  const [pendingUnbind, setPendingUnbind] = useState<{ platform: 'telegram' | 'feishu'; userId: string | number } | null>(null)
+  const [pendingUnbind, setPendingUnbind] = useState<{ platform: ImPlatform; userId: string | number } | null>(null)
   const [isUnbinding, setIsUnbinding] = useState(false)
 
   useEffect(() => {
@@ -56,7 +97,97 @@ export function AdapterSettings() {
     setFsVerificationToken(config.feishu?.verificationToken ?? '')
     setFsAllowedUsers(config.feishu?.allowedUsers?.join(', ') ?? '')
     setFsStreamingCard(config.feishu?.streamingCard ?? false)
+    setWcAllowedUsers(config.wechat?.allowedUsers?.join(', ') ?? '')
+    setDtClientId(config.dingtalk?.clientId ?? '')
+    setDtClientSecret(config.dingtalk?.clientSecret ?? '')
+    setDtAllowedUsers(config.dingtalk?.allowedUsers?.join(', ') ?? '')
+    setDtEndpoint(config.dingtalk?.endpoint ?? '')
+    setDtPermissionCardTemplateId(config.dingtalk?.permissionCardTemplateId ?? '')
   }, [config])
+
+  useEffect(() => {
+    if (!wechatSessionKey) return
+
+    let cancelled = false
+    let timer: number | null = null
+
+    const poll = async () => {
+      try {
+        const result = await pollWechatLogin(wechatSessionKey)
+        if (cancelled) return
+        if (result.connected) {
+          setWechatStatus(t('settings.adapters.wechatBindSuccess'))
+          setWechatQrUrl(null)
+          setWechatSessionKey(null)
+          setIsWechatBinding(false)
+          return
+        }
+        if (result.message) {
+          setWechatStatus(result.message)
+        }
+        if (result.status === 'expired' || result.status === 'not_started') {
+          setWechatQrUrl(null)
+          setWechatSessionKey(null)
+          setIsWechatBinding(false)
+          return
+        }
+      } catch (err) {
+        if (!cancelled) setWechatStatus(err instanceof Error ? err.message : 'WeChat bind failed')
+      }
+
+      if (!cancelled) {
+        timer = window.setTimeout(() => void poll(), 1200)
+      }
+    }
+
+    timer = window.setTimeout(() => void poll(), 1200)
+
+    return () => {
+      cancelled = true
+      if (timer != null) window.clearTimeout(timer)
+    }
+  }, [wechatSessionKey, pollWechatLogin, t])
+
+  useEffect(() => {
+    if (!dtRegistration || dtAuthStatus !== 'waiting') return
+
+    let cancelled = false
+    const poll = async () => {
+      if (Date.now() > dtRegistration.expiresAt) {
+        setDtAuthStatus('error')
+        setDtAuthError(t('settings.adapters.dingtalkAuthExpired'))
+        setDtRegistration(null)
+        return
+      }
+
+      try {
+        const result = await pollDingtalkRegistration(dtRegistration.deviceCode)
+        if (cancelled) return
+        if (result.status === 'SUCCESS') {
+          setDtAuthStatus('bound')
+          setDtRegistration(null)
+          setDtAuthError('')
+          await fetchConfig()
+        } else if (result.status === 'FAIL' || result.status === 'EXPIRED') {
+          setDtAuthStatus('error')
+          setDtAuthError(result.failReason || t('settings.adapters.dingtalkAuthFailed'))
+          setDtRegistration(null)
+        }
+      } catch (err) {
+        if (!cancelled) {
+          setDtAuthStatus('error')
+          setDtAuthError(err instanceof Error ? err.message : t('settings.adapters.dingtalkAuthFailed'))
+        }
+      }
+    }
+
+    const timer = window.setInterval(poll, Math.max(1, dtRegistration.intervalSeconds) * 1000)
+    void poll()
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+    }
+  }, [dtRegistration, dtAuthStatus, pollDingtalkRegistration, fetchConfig, t])
 
   async function handleSave() {
     setIsSaving(true)
@@ -93,6 +224,29 @@ export function AdapterSettings() {
         streamingCard: fsStreamingCard,
       }
 
+      const wcUsers = wcAllowedUsers
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+
+      patch.wechat = {
+        ...config.wechat,
+        allowedUsers: wcUsers.length ? wcUsers : [],
+      }
+
+      const dtUsers = dtAllowedUsers
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean)
+
+      patch.dingtalk = {
+        clientId: dtClientId || undefined,
+        clientSecret: dtClientSecret || undefined,
+        allowedUsers: dtUsers.length ? dtUsers : [],
+        endpoint: dtEndpoint || undefined,
+        permissionCardTemplateId: dtPermissionCardTemplateId || undefined,
+      }
+
       await updateConfig(patch)
       setSaveStatus('saved')
       setTimeout(() => setSaveStatus('idle'), 2000)
@@ -116,7 +270,84 @@ export function AdapterSettings() {
     }
   }, [generatePairingCode])
 
-  const handleUnbind = useCallback(async (platform: 'telegram' | 'feishu', userId: string | number) => {
+  const handleWechatBind = useCallback(async () => {
+    setIsWechatBinding(true)
+    setWechatStatus('')
+    try {
+      const result = await startWechatLogin()
+      if (!result.qrcodeUrl) {
+        throw new Error(result.message || 'WeChat QR URL missing')
+      }
+      const qrDataUrl = await QRCode.toDataURL(result.qrcodeUrl, {
+        errorCorrectionLevel: 'M',
+        margin: 1,
+        scale: 8,
+      })
+      setWechatQrUrl(qrDataUrl)
+      setWechatSessionKey(result.sessionKey)
+      setWechatStatus(result.message)
+    } catch (err) {
+      setWechatStatus(err instanceof Error ? err.message : 'WeChat bind failed')
+      setIsWechatBinding(false)
+    }
+  }, [startWechatLogin])
+
+  const handleStartDingtalkAuth = useCallback(async () => {
+    setIsStartingDtAuth(true)
+    setDtAuthStatus('idle')
+    setDtAuthError('')
+    try {
+      const begin = await beginDingtalkRegistration()
+      setDtRegistration({
+        deviceCode: begin.deviceCode,
+        verificationUriComplete: begin.verificationUriComplete,
+        qrDataUrl: begin.qrDataUrl,
+        intervalSeconds: begin.intervalSeconds,
+        expiresAt: Date.now() + begin.expiresInSeconds * 1000,
+      })
+      setDtAuthStatus('waiting')
+    } catch (err) {
+      setDtAuthStatus('error')
+      setDtAuthError(err instanceof Error ? err.message : t('settings.adapters.dingtalkAuthFailed'))
+    } finally {
+      setIsStartingDtAuth(false)
+    }
+  }, [beginDingtalkRegistration, t])
+
+  const handleUnbindWechatAccount = useCallback(async () => {
+    setIsUnbindingWechatAccount(true)
+    setWechatStatus('')
+    try {
+      await unbindWechatAccount()
+      await fetchConfig()
+      setWechatQrUrl(null)
+      setWechatSessionKey(null)
+      setWechatStatus(t('settings.adapters.wechatUnbound'))
+    } catch (err) {
+      setWechatStatus(err instanceof Error ? err.message : t('settings.adapters.wechatUnbindFailed'))
+    } finally {
+      setIsUnbindingWechatAccount(false)
+      setIsWechatBinding(false)
+    }
+  }, [unbindWechatAccount, fetchConfig, t])
+
+  const handleUnbindDingtalkBot = useCallback(async () => {
+    setIsUnbindingDtBot(true)
+    setDtAuthError('')
+    try {
+      await unbindDingtalkBot()
+      setDtAuthStatus('idle')
+      setDtRegistration(null)
+      await fetchConfig()
+    } catch (err) {
+      setDtAuthStatus('error')
+      setDtAuthError(err instanceof Error ? err.message : t('settings.adapters.dingtalkUnbindFailed'))
+    } finally {
+      setIsUnbindingDtBot(false)
+    }
+  }, [unbindDingtalkBot, fetchConfig, t])
+
+  const handleUnbind = useCallback(async (platform: ImPlatform, userId: string | number) => {
     setPendingUnbind({ platform, userId })
   }, [])
 
@@ -136,6 +367,8 @@ export function AdapterSettings() {
   const allPairedUsers = [
     ...(config.telegram?.pairedUsers ?? []).map((u) => ({ ...u, platform: 'telegram' as const })),
     ...(config.feishu?.pairedUsers ?? []).map((u) => ({ ...u, platform: 'feishu' as const })),
+    ...(config.wechat?.pairedUsers ?? []).map((u) => ({ ...u, platform: 'wechat' as const })),
+    ...(config.dingtalk?.pairedUsers ?? []).map((u) => ({ ...u, platform: 'dingtalk' as const })),
   ]
 
   // Check pairing expiry
@@ -254,6 +487,16 @@ export function AdapterSettings() {
             onClick={() => setActiveIm('feishu')}
           />
           <ImTabButton
+            label={t('settings.adapters.wechat')}
+            active={activeIm === 'wechat'}
+            onClick={() => setActiveIm('wechat')}
+          />
+          <ImTabButton
+            label={t('settings.adapters.dingtalk')}
+            active={activeIm === 'dingtalk'}
+            onClick={() => setActiveIm('dingtalk')}
+          />
+          <ImTabButton
             label={t('settings.adapters.telegram')}
             active={activeIm === 'telegram'}
             onClick={() => setActiveIm('telegram')}
@@ -314,6 +557,153 @@ export function AdapterSettings() {
                 <p className="text-xs text-[var(--color-text-tertiary)]">{t('settings.adapters.streamingCardDesc')}</p>
               </div>
             </label>
+          </div>
+        )}
+
+        {activeIm === 'wechat' && (
+          <div className="p-4 space-y-4">
+            <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-4 space-y-3">
+              <div className="flex items-center justify-between gap-4">
+                <div>
+                  <div className="text-sm font-medium text-[var(--color-text-primary)]">
+                    {config.wechat?.accountId ? t('settings.adapters.wechatConnected') : t('settings.adapters.wechatNotConnected')}
+                  </div>
+                  <p className="text-xs text-[var(--color-text-tertiary)]">
+                    {t('settings.adapters.wechatQrHint')}
+                  </p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <Button onClick={handleWechatBind} loading={isWechatBinding && !wechatQrUrl} size="sm">
+                    {config.wechat?.accountId ? t('settings.adapters.wechatRebind') : t('settings.adapters.wechatBind')}
+                  </Button>
+                  {config.wechat?.accountId && (
+                    <Button onClick={handleUnbindWechatAccount} loading={isUnbindingWechatAccount} size="sm" variant="danger">
+                      {t('settings.adapters.wechatUnbindAccount')}
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              {wechatQrUrl && (
+                <div className="flex items-start gap-4">
+                  <img
+                    src={wechatQrUrl}
+                    alt={t('settings.adapters.wechatQrAlt')}
+                    className="h-40 w-40 rounded-lg border border-[var(--color-border)] bg-white object-contain p-2"
+                  />
+                  <div className="pt-2 text-sm text-[var(--color-text-secondary)]">
+                    {wechatStatus || t('settings.adapters.wechatWaiting')}
+                  </div>
+                </div>
+              )}
+
+              {!wechatQrUrl && wechatStatus && (
+                <p className="text-sm text-[var(--color-text-secondary)]">{wechatStatus}</p>
+              )}
+            </div>
+
+            <div className="flex flex-col gap-1">
+              <Input
+                label={t('settings.adapters.allowedUsers')}
+                value={wcAllowedUsers}
+                onChange={(e) => setWcAllowedUsers(e.target.value)}
+                placeholder={t('settings.adapters.wcAllowedUsersPlaceholder')}
+              />
+              <p className="text-xs text-[var(--color-text-tertiary)]">{t('settings.adapters.wechatAllowedUsersHint')}</p>
+            </div>
+          </div>
+        )}
+
+        {activeIm === 'dingtalk' && (
+          <div className="p-4 space-y-4">
+            <div className="rounded-lg border border-[var(--color-border)] bg-[var(--color-surface)] p-4 space-y-3">
+              <div className="flex items-start justify-between gap-4">
+                <div>
+                  <h4 className="text-sm font-semibold text-[var(--color-text-primary)]">{t('settings.adapters.dingtalkQrTitle')}</h4>
+                  <p className="mt-1 text-xs text-[var(--color-text-tertiary)]">{t('settings.adapters.dingtalkQrDesc')}</p>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <Button onClick={handleStartDingtalkAuth} loading={isStartingDtAuth} size="sm">
+                    {t('settings.adapters.dingtalkStartAuth')}
+                  </Button>
+                  {(config.dingtalk?.clientId || dtClientId) && (
+                    <Button onClick={handleUnbindDingtalkBot} loading={isUnbindingDtBot} size="sm" variant="danger">
+                      {t('settings.adapters.dingtalkUnbindBot')}
+                    </Button>
+                  )}
+                </div>
+              </div>
+
+              {dtRegistration && (
+                <div className="flex flex-wrap items-center gap-4">
+                  {dtRegistration.qrDataUrl ? (
+                    <img
+                      src={dtRegistration.qrDataUrl}
+                      alt={t('settings.adapters.dingtalkQrAlt')}
+                      className="h-40 w-40 rounded-lg border border-[var(--color-border)] bg-white object-contain p-2"
+                    />
+                  ) : null}
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <p className="text-sm text-[var(--color-text-primary)]">{t('settings.adapters.dingtalkWaiting')}</p>
+                    <a
+                      href={dtRegistration.verificationUriComplete}
+                      target="_blank"
+                      rel="noreferrer"
+                      className="block truncate text-xs text-[var(--color-brand)] hover:underline"
+                    >
+                      {dtRegistration.verificationUriComplete}
+                    </a>
+                  </div>
+                </div>
+              )}
+
+              {dtAuthStatus === 'bound' && (
+                <p className="text-sm text-[var(--color-success)]">{t('settings.adapters.dingtalkBound')}</p>
+              )}
+              {dtAuthStatus === 'error' && (
+                <p className="text-sm text-[var(--color-error)]">{dtAuthError}</p>
+              )}
+            </div>
+
+            <div className="grid grid-cols-2 gap-4">
+              <Input
+                label={t('settings.adapters.dingtalkClientId')}
+                value={dtClientId}
+                onChange={(e) => setDtClientId(e.target.value)}
+                placeholder={t('settings.adapters.dingtalkClientIdPlaceholder')}
+              />
+              <Input
+                label={t('settings.adapters.dingtalkClientSecret')}
+                type="password"
+                value={dtClientSecret}
+                onChange={(e) => setDtClientSecret(e.target.value)}
+                placeholder={t('settings.adapters.dingtalkClientSecretPlaceholder')}
+              />
+            </div>
+            <Input
+              label={t('settings.adapters.dingtalkEndpoint')}
+              value={dtEndpoint}
+              onChange={(e) => setDtEndpoint(e.target.value)}
+              placeholder={t('settings.adapters.dingtalkEndpointPlaceholder')}
+            />
+            <div className="flex flex-col gap-1">
+              <Input
+                label={t('settings.adapters.dingtalkPermissionCardTemplateId')}
+                value={dtPermissionCardTemplateId}
+                onChange={(e) => setDtPermissionCardTemplateId(e.target.value)}
+                placeholder={t('settings.adapters.dingtalkPermissionCardTemplateIdPlaceholder')}
+              />
+              <p className="text-xs text-[var(--color-text-tertiary)]">{t('settings.adapters.dingtalkPermissionCardTemplateIdHint')}</p>
+            </div>
+            <div className="flex flex-col gap-1">
+              <Input
+                label={t('settings.adapters.allowedUsers')}
+                value={dtAllowedUsers}
+                onChange={(e) => setDtAllowedUsers(e.target.value)}
+                placeholder={t('settings.adapters.dtAllowedUsersPlaceholder')}
+              />
+              <p className="text-xs text-[var(--color-text-tertiary)]">{t('settings.adapters.allowedUsersHint')}</p>
+            </div>
           </div>
         )}
 

@@ -42,6 +42,24 @@ export type AdapterFileConfig = {
     defaultWorkDir?: string
     streamingCard?: boolean
   }
+  wechat?: {
+    accountId?: string
+    botToken?: string
+    baseUrl?: string
+    userId?: string
+    allowedUsers?: string[]
+    pairedUsers?: PairedUser[]
+    defaultWorkDir?: string
+  }
+  dingtalk?: {
+    clientId?: string
+    clientSecret?: string
+    allowedUsers?: string[]
+    pairedUsers?: PairedUser[]
+    defaultWorkDir?: string
+    endpoint?: string
+    permissionCardTemplateId?: string
+  }
 }
 
 function getConfigPath(): string {
@@ -84,6 +102,12 @@ class AdapterService {
       if (config.feishu.encryptKey) config.feishu.encryptKey = maskSecret(config.feishu.encryptKey)
       if (config.feishu.verificationToken) config.feishu.verificationToken = maskSecret(config.feishu.verificationToken)
     }
+    if (config.wechat?.botToken) {
+      config.wechat.botToken = maskSecret(config.wechat.botToken)
+    }
+    if (config.dingtalk?.clientSecret) {
+      config.dingtalk.clientSecret = maskSecret(config.dingtalk.clientSecret)
+    }
     if (config.pairing?.code) {
       config.pairing.code = '******'
     }
@@ -103,6 +127,12 @@ class AdapterService {
       if (isMasked(patch.feishu.encryptKey)) patch.feishu.encryptKey = current.feishu?.encryptKey
       if (isMasked(patch.feishu.verificationToken)) patch.feishu.verificationToken = current.feishu?.verificationToken
     }
+    if (patch.wechat && isMasked(patch.wechat.botToken)) {
+      patch.wechat.botToken = current.wechat?.botToken
+    }
+    if (patch.dingtalk && isMasked(patch.dingtalk.clientSecret)) {
+      patch.dingtalk.clientSecret = current.dingtalk?.clientSecret
+    }
     if (patch.pairing && isMasked(patch.pairing.code ?? undefined)) {
       patch.pairing.code = current.pairing?.code
     }
@@ -112,6 +142,8 @@ class AdapterService {
       ...patch,
       telegram: patch.telegram ? { ...current.telegram, ...patch.telegram } : current.telegram,
       feishu: patch.feishu ? { ...current.feishu, ...patch.feishu } : current.feishu,
+      wechat: patch.wechat ? { ...current.wechat, ...patch.wechat } : current.wechat,
+      dingtalk: patch.dingtalk ? { ...current.dingtalk, ...patch.dingtalk } : current.dingtalk,
       pairing: patch.pairing !== undefined ? { ...current.pairing, ...patch.pairing } : current.pairing,
     }
 
@@ -121,12 +153,16 @@ class AdapterService {
   private async writeConfig(data: AdapterFileConfig): Promise<void> {
     const filePath = getConfigPath()
     const dir = path.dirname(filePath)
-    await fs.mkdir(dir, { recursive: true })
+    await fs.mkdir(dir, { recursive: true, mode: 0o700 })
 
     const tmpFile = `${filePath}.tmp.${Date.now()}`
     try {
-      await fs.writeFile(tmpFile, JSON.stringify(data, null, 2) + '\n', 'utf-8')
+      await fs.writeFile(tmpFile, JSON.stringify(data, null, 2) + '\n', {
+        encoding: 'utf-8',
+        mode: 0o600,
+      })
       await fs.rename(tmpFile, filePath)
+      await fs.chmod(filePath, 0o600).catch(() => {})
     } catch (err) {
       await fs.unlink(tmpFile).catch(() => {})
       throw ApiError.internal(`Failed to write adapter config: ${err}`)

@@ -28,6 +28,7 @@ type CollectContextDataInput = {
     agentDefinitions: AgentDefinitionsResult
     customSystemPrompt?: string
     appendSystemPrompt?: string
+    estimateOnly?: boolean
   }
 }
 
@@ -43,6 +44,7 @@ export async function collectContextData(
       agentDefinitions,
       customSystemPrompt,
       appendSystemPrompt,
+      estimateOnly,
     },
   } = context
 
@@ -73,6 +75,7 @@ export async function collectContextData(
     >,
     undefined, // mainThreadAgentDefinition
     apiView, // original messages for API usage extraction
+    { estimateOnly },
   )
 }
 

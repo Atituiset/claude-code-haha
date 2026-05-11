@@ -23,7 +23,7 @@ async function invoke<T>(command: string, args?: Record<string, unknown>): Promi
   if (!isTauriRuntime()) {
     throw new Error('Terminal is available in the desktop app runtime.')
   }
-  const api = await import(/* @vite-ignore */ '@tauri-apps/api/core')
+  const api = await import('@tauri-apps/api/core')
   return api.invoke<T>(command, args)
 }
 
@@ -47,12 +47,12 @@ export const terminalApi = {
   },
 
   async onOutput(handler: (payload: TerminalOutputPayload) => void): Promise<Unlisten> {
-    const events = await import(/* @vite-ignore */ '@tauri-apps/api/event')
+    const events = await import('@tauri-apps/api/event')
     return events.listen<TerminalOutputPayload>('terminal-output', (event) => handler(event.payload))
   },
 
   async onExit(handler: (payload: TerminalExitPayload) => void): Promise<Unlisten> {
-    const events = await import(/* @vite-ignore */ '@tauri-apps/api/event')
+    const events = await import('@tauri-apps/api/event')
     return events.listen<TerminalExitPayload>('terminal-exit', (event) => handler(event.payload))
   },
 }

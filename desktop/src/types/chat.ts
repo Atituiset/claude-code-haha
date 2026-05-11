@@ -31,13 +31,22 @@ export type AttachmentRef = {
   path?: string
   data?: string
   mimeType?: string
+  lineStart?: number
+  lineEnd?: number
+  note?: string
+  quote?: string
 }
 
 export type UIAttachment = {
   type: 'file' | 'image'
   name: string
+  path?: string
   data?: string
   mimeType?: string
+  lineStart?: number
+  lineEnd?: number
+  note?: string
+  quote?: string
 }
 
 // ─── Server → Client ──────────────────────────────────────────────
@@ -157,7 +166,7 @@ export type TaskSummaryItem = {
 }
 
 export type UIMessage =
-  | { id: string; type: 'user_text'; content: string; timestamp: number; attachments?: UIAttachment[]; pending?: boolean }
+  | { id: string; type: 'user_text'; content: string; modelContent?: string; timestamp: number; attachments?: UIAttachment[]; pending?: boolean }
   | { id: string; type: 'assistant_text'; content: string; timestamp: number; model?: string }
   | { id: string; type: 'thinking'; content: string; timestamp: number }
   | { id: string; type: 'tool_use'; toolName: string; toolUseId: string; input: unknown; timestamp: number; parentToolUseId?: string }

@@ -31,6 +31,7 @@ export type Toast = {
 export type SettingsTab =
   | 'providers'
   | 'permissions'
+  | 'activity'
   | 'general'
   | 'adapters'
   | 'terminal'
@@ -39,6 +40,7 @@ export type SettingsTab =
   | 'skills'
   | 'plugins'
   | 'computerUse'
+  | 'diagnostics'
   | 'about'
 
 type ActiveView = 'code' | 'scheduled' | 'terminal' | 'history' | 'settings'

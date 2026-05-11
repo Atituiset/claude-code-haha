@@ -17,7 +17,14 @@ import { computerUseApprovalService } from '../services/computerUseApprovalServi
 import { sessionService } from '../services/sessionService.js'
 import { SettingsService } from '../services/settingsService.js'
 import { ProviderService } from '../services/providerService.js'
+import { diagnosticsService } from '../services/diagnosticsService.js'
 import { deriveTitle, generateTitle, saveAiTitle } from '../services/titleService.js'
+import { parseSlashCommand } from '../../utils/slashCommandParsing.js'
+import {
+  LOCAL_COMMAND_STDERR_TAG,
+  LOCAL_COMMAND_STDOUT_TAG,
+} from '../../constants/xml.js'
+import { shouldCreateWorktreeForSessionLaunch } from '../services/repositoryLaunchService.js'
 
 const settingsService = new SettingsService()
 const providerService = new ProviderService()
@@ -47,6 +54,7 @@ const sessionTitleState = new Map<string, {
   hasCustomTitle: boolean
   firstUserMessage: string
   allUserMessages: string[]
+  startedGenerationCounts: Set<number>
 }>()
 
 const runtimeOverrides = new Map<string, {
@@ -56,10 +64,27 @@ const runtimeOverrides = new Map<string, {
 
 const runtimeTransitionPromises = new Map<string, Promise<void>>()
 const sessionStartupPromises = new Map<string, Promise<void>>()
+const lastResolvedStartupWorkDirs = new Map<string, string>()
 const prewarmPendingSessions = new Set<string>()
 const prewarmedSessions = new Set<string>()
 const prewarmIdleTimers = new Map<string, ReturnType<typeof setTimeout>>()
 const DEFAULT_PREWARM_IDLE_TIMEOUT_MS = 5 * 60_000
+
+async function sendRepositoryStartupStatus(
+  ws: ServerWebSocket<WebSocketData>,
+  sessionId: string,
+  reason: 'user_message' | 'prewarm_session',
+): Promise<void> {
+  if (reason !== 'user_message') return
+
+  const launchInfo = await sessionService.getSessionLaunchInfo(sessionId).catch(() => null)
+  const repository = launchInfo?.repository
+  if (!repository) return
+
+  if (shouldCreateWorktreeForSessionLaunch(launchInfo)) {
+    sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Creating worktree' })
+  }
+}
 
 export function getSlashCommands(sessionId: string): Array<{ name: string; description: string }> {
   return sessionSlashCommands.get(sessionId) || []
@@ -128,6 +153,13 @@ export const handleWebSocket = {
       switch (message.type) {
         case 'user_message':
           handleUserMessage(ws, message).catch((err) => {
+            void diagnosticsService.recordEvent({
+              type: 'ws_user_message_failed',
+              severity: 'error',
+              sessionId: ws.data.sessionId,
+              summary: err instanceof Error ? err.message : String(err),
+              details: err,
+            })
             console.error(`[WS] Unhandled error in handleUserMessage:`, err)
           })
           break
@@ -149,7 +181,7 @@ export const handleWebSocket = {
           break
 
         case 'prewarm_session':
-          handlePrewarmSession(ws)
+          void handlePrewarmSession(ws)
           break
 
         case 'stop_generation':
@@ -178,6 +210,10 @@ export const handleWebSocket = {
     }
 
     console.log(`[WS] Client disconnected from session: ${sessionId} (${code}: ${reason})`)
+    if (activeSessions.get(sessionId) !== ws) {
+      console.log(`[WS] Ignoring stale client disconnect for session: ${sessionId}`)
+      return
+    }
     computerUseApprovalService.cancelSession(sessionId)
     activeSessions.delete(sessionId)
     conversationService.clearOutputCallbacks(sessionId)
@@ -214,25 +250,49 @@ async function handleUserMessage(
   sessionStopRequested.delete(sessionId)
   clearPrewarmState(sessionId)
 
+  const desktopSlashCommand = getDesktopSlashCommand(message.content)
+  if (desktopSlashCommand?.commandName === 'clear' && desktopSlashCommand.args.trim()) {
+    sendMessage(ws, {
+      type: 'error',
+      message: 'The /clear command does not accept arguments.',
+      code: 'INVALID_SLASH_COMMAND_ARGS',
+    })
+    sendMessage(ws, { type: 'status', state: 'idle' })
+    return
+  }
+
+  if (desktopSlashCommand?.commandName === 'clear') {
+    await handleDesktopClearCommand(ws)
+    return
+  }
+
   // Send thinking status
   sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Thinking' })
 
-  const pendingRuntimeTransition = runtimeTransitionPromises.get(sessionId)
-  if (pendingRuntimeTransition) {
-    try {
-      await pendingRuntimeTransition
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err)
-      console.error(`[WS] Runtime transition failed before handling user message for ${sessionId}: ${errMsg}`)
-      sendMessage(ws, {
-        type: 'error',
-        message: `Failed to switch provider/model: ${errMsg}`,
-        code: 'CLI_RESTART_FAILED',
-      })
-      sendMessage(ws, { type: 'status', state: 'idle' })
-      return
-    }
+  const initialRuntimeTransition = await waitForRuntimeTransitionBeforeUserTurn(ws, sessionId)
+  if (!initialRuntimeTransition.ok) return
+  if (initialRuntimeTransition.waited) {
+    sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Thinking' })
   }
+
+  // Track and emit the first placeholder title before CLI startup/streaming.
+  let titleState = sessionTitleState.get(sessionId)
+  if (!titleState) {
+    titleState = {
+      userMessageCount: 0,
+      hasCustomTitle: !!(await sessionService.getCustomTitle(sessionId)),
+      firstUserMessage: '',
+      allUserMessages: [],
+      startedGenerationCounts: new Set<number>(),
+    }
+    sessionTitleState.set(sessionId, titleState)
+  }
+  titleState.userMessageCount++
+  titleState.allUserMessages.push(message.content)
+  if (titleState.userMessageCount === 1) {
+    titleState.firstUserMessage = message.content
+  }
+  triggerTitleGeneration(ws, sessionId)
 
   // 启动 CLI 子进程（如果还没有）
   try {
@@ -244,7 +304,7 @@ async function handleUserMessage(
     console.error(`[WS] CLI start failed for ${sessionId}: ${errMsg}`)
     sendMessage(ws, {
       type: 'error',
-      message: errMsg,
+      message: await buildSessionStartupDiagnosticMessage(sessionId, errMsg),
       code,
       retryable:
         err instanceof ConversationStartupError ? err.retryable : false,
@@ -253,16 +313,13 @@ async function handleUserMessage(
     return
   }
 
-  // Track user message for title generation
-  let titleState = sessionTitleState.get(sessionId)
-  if (!titleState) {
-    titleState = { userMessageCount: 0, hasCustomTitle: false, firstUserMessage: '', allUserMessages: [] }
-    sessionTitleState.set(sessionId, titleState)
-  }
-  titleState.userMessageCount++
-  titleState.allUserMessages.push(message.content)
-  if (titleState.userMessageCount === 1) {
-    titleState.firstUserMessage = message.content
+  const startupRuntimeTransition = await waitForRuntimeTransitionBeforeUserTurn(ws, sessionId)
+  if (startupRuntimeTransition.ok) {
+    if (startupRuntimeTransition.waited) {
+      sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Thinking' })
+    }
+  } else {
+    return
   }
 
   // Register the callback before sending the turn so startup errors are not lost.
@@ -292,9 +349,51 @@ async function handleUserMessage(
   userMessageSent = true
 }
 
-function handlePrewarmSession(ws: ServerWebSocket<WebSocketData>) {
+async function handleDesktopClearCommand(
+  ws: ServerWebSocket<WebSocketData>,
+) {
+  const { sessionId } = ws.data
+
+  const workDir = conversationService.getSessionWorkDir(sessionId)
+  conversationService.stopSession(sessionId)
+  conversationService.clearOutputCallbacks(sessionId)
+  sessionSlashCommands.delete(sessionId)
+  sessionTitleState.delete(sessionId)
+  cleanupStreamState(sessionId)
+
+  try {
+    await sessionService.clearSessionTranscript(sessionId, workDir || undefined)
+  } catch (err) {
+    const errMsg = err instanceof Error ? err.message : String(err)
+    sendMessage(ws, {
+      type: 'error',
+      message: errMsg,
+      code: 'SESSION_CLEAR_FAILED',
+    })
+    sendMessage(ws, { type: 'status', state: 'idle' })
+    return
+  }
+
+  sendMessage(ws, {
+    type: 'system_notification',
+    subtype: 'session_cleared',
+    message: 'Conversation cleared',
+  })
+  sendMessage(ws, {
+    type: 'message_complete',
+    usage: { input_tokens: 0, output_tokens: 0 },
+  })
+}
+
+async function handlePrewarmSession(ws: ServerWebSocket<WebSocketData>) {
   const { sessionId } = ws.data
   if (conversationService.hasSession(sessionId) || sessionStartupPromises.has(sessionId)) {
+    return
+  }
+
+  const launchInfo = await sessionService.getSessionLaunchInfo(sessionId).catch(() => null)
+  if (launchInfo?.repository) {
+    console.log(`[WS] Skipping prewarm for pending repository launch session ${sessionId}`)
     return
   }
 
@@ -362,7 +461,9 @@ function handleSetPermissionMode(
     (message.mode === 'bypassPermissions' || conversationService.getSessionPermissionMode(sessionId) === 'bypassPermissions')
 
   if (needsRestart) {
-    void restartSessionWithPermissionMode(ws, sessionId, message.mode)
+    void enqueueRuntimeTransition(sessionId, () =>
+      restartSessionWithPermissionMode(ws, sessionId, message.mode),
+    )
     return
   }
 
@@ -403,6 +504,21 @@ async function handleSetRuntimeConfig(
   }
 
   if (!conversationService.hasSession(sessionId)) {
+    const pendingStartup = sessionStartupPromises.get(sessionId)
+    if (pendingStartup) {
+      await enqueueRuntimeTransition(sessionId, async () => {
+        await pendingStartup.catch(() => undefined)
+        const currentOverride = runtimeOverrides.get(sessionId)
+        if (
+          currentOverride?.providerId !== nextOverride.providerId ||
+          currentOverride.modelId !== nextOverride.modelId ||
+          !conversationService.hasSession(sessionId)
+        ) {
+          return
+        }
+        await restartSessionWithRuntimeConfig(ws, sessionId)
+      })
+    }
     return
   }
 
@@ -417,8 +533,6 @@ async function restartSessionWithPermissionMode(
   mode: string,
 ): Promise<void> {
   try {
-    sendMessage(ws, { type: 'status', state: 'thinking', verb: 'Restarting session with new permissions...' })
-
     // Persist the new mode first so it's read on restart
     await settingsService.setPermissionMode(mode)
 
@@ -436,10 +550,20 @@ async function restartSessionWithPermissionMode(
     console.log(`[WS] Restarted CLI for ${sessionId} with permission mode: ${mode}`)
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
+    void diagnosticsService.recordEvent({
+      type: 'permission_restart_failed',
+      severity: 'error',
+      sessionId,
+      summary: errMsg,
+      details: { mode, error: err },
+    })
     console.error(`[WS] Failed to restart CLI for ${sessionId}: ${errMsg}`)
     sendMessage(ws, {
       type: 'error',
-      message: `Failed to restart session with new permission mode: ${errMsg}`,
+      message: await buildSessionStartupDiagnosticMessage(
+        sessionId,
+        `Failed to restart session with new permission mode: ${errMsg}`,
+      ),
       code: 'CLI_RESTART_FAILED',
     })
     sendMessage(ws, { type: 'status', state: 'idle' })
@@ -451,12 +575,6 @@ async function restartSessionWithRuntimeConfig(
   sessionId: string,
 ): Promise<void> {
   try {
-    sendMessage(ws, {
-      type: 'status',
-      state: 'thinking',
-      verb: 'Switching provider and model...',
-    })
-
     const workDir = conversationService.getSessionWorkDir(sessionId)
     conversationService.stopSession(sessionId)
 
@@ -470,10 +588,20 @@ async function restartSessionWithRuntimeConfig(
     console.log(`[WS] Restarted CLI for ${sessionId} with runtime override`)
   } catch (err) {
     const errMsg = err instanceof Error ? err.message : String(err)
+    void diagnosticsService.recordEvent({
+      type: 'runtime_config_restart_failed',
+      severity: 'error',
+      sessionId,
+      summary: errMsg,
+      details: { runtimeOverride: runtimeOverrides.get(sessionId), error: err },
+    })
     console.error(`[WS] Failed to restart CLI for ${sessionId} after runtime override: ${errMsg}`)
     sendMessage(ws, {
       type: 'error',
-      message: `Failed to switch provider/model: ${errMsg}`,
+      message: await buildSessionStartupDiagnosticMessage(
+        sessionId,
+        `Failed to switch provider/model: ${errMsg}`,
+      ),
       code: 'CLI_RESTART_FAILED',
     })
     sendMessage(ws, { type: 'status', state: 'idle' })
@@ -514,6 +642,8 @@ function triggerTitleGeneration(ws: ServerWebSocket<WebSocketData>, sessionId: s
 
   // Generate on count 1 (first response) and count 3 (with more context)
   if (count !== 1 && count !== 3) return
+  if (state.startedGenerationCounts.has(count)) return
+  state.startedGenerationCounts.add(count)
 
   const text = count === 1
     ? state.firstUserMessage
@@ -527,7 +657,11 @@ function triggerTitleGeneration(ws: ServerWebSocket<WebSocketData>, sessionId: s
       if (count === 1) {
         const placeholder = deriveTitle(text)
         if (placeholder) {
-          await saveAiTitle(sessionId, placeholder)
+          const saved = await saveAiTitle(sessionId, placeholder)
+          if (!saved) {
+            state.hasCustomTitle = true
+            return
+          }
           sendMessage(ws, { type: 'session_title_updated', sessionId, title: placeholder })
         }
       }
@@ -535,7 +669,11 @@ function triggerTitleGeneration(ws: ServerWebSocket<WebSocketData>, sessionId: s
       // Stage 2: AI-generated title
       const aiTitle = await generateTitle(text, runtimeProviderId)
       if (aiTitle) {
-        await saveAiTitle(sessionId, aiTitle)
+        const saved = await saveAiTitle(sessionId, aiTitle)
+        if (!saved) {
+          state.hasCustomTitle = true
+          return
+        }
         sendMessage(ws, { type: 'session_title_updated', sessionId, title: aiTitle })
       }
     } catch (err) {
@@ -559,6 +697,10 @@ type SessionStreamState = {
   /** Tool blocks whose input JSON failed to parse in content_block_stop.
    *  The assistant message carries the complete input — defer to that. */
   pendingToolBlocks: Map<string, { toolName: string; toolUseId: string; parentToolUseId?: string }>
+  lastApiError?: {
+    message: string
+    code: string
+  }
 }
 
 const sessionStreamStates = new Map<string, SessionStreamState>()
@@ -571,6 +713,7 @@ function getStreamState(sessionId: string): SessionStreamState {
       activeBlockTypes: new Map(),
       activeToolBlocks: new Map(),
       pendingToolBlocks: new Map(),
+      lastApiError: undefined,
     }
     sessionStreamStates.set(sessionId, state)
   }
@@ -589,6 +732,7 @@ function cleanupSessionRuntimeState(sessionId: string) {
   runtimeOverrides.delete(sessionId)
   runtimeTransitionPromises.delete(sessionId)
   sessionStartupPromises.delete(sessionId)
+  lastResolvedStartupWorkDirs.delete(sessionId)
   clearPrewarmState(sessionId)
 }
 
@@ -631,12 +775,46 @@ function markPrewarmed(sessionId: string) {
 
 function cacheSessionInitMetadata(sessionId: string, cliMsg: any) {
   if (cliMsg?.type !== 'system' || cliMsg.subtype !== 'init') return
+  if (typeof cliMsg.cwd === 'string' && cliMsg.cwd.trim()) {
+    conversationService.updateSessionWorkDir(sessionId, cliMsg.cwd)
+    void (async () => {
+      await sessionService.appendSessionMetadata(sessionId, {
+        workDir: cliMsg.cwd,
+      })
+      await sessionService.deletePlaceholderSessionFiles(sessionId, cliMsg.cwd)
+    })()
+  }
   if (cliMsg.slash_commands && Array.isArray(cliMsg.slash_commands)) {
     sessionSlashCommands.set(sessionId, cliMsg.slash_commands.map((cmd: any) => ({
       name: typeof cmd === 'string' ? cmd : (cmd.name || cmd.command || ''),
       description: typeof cmd === 'string' ? '' : (cmd.description || ''),
     })))
   }
+}
+
+function extractAssistantText(cliMsg: any): string {
+  const content = cliMsg?.message?.content
+  if (!Array.isArray(content)) return ''
+  const textBlock = content.find(
+    (block: unknown): block is { type: string; text: string } =>
+      !!block &&
+      typeof block === 'object' &&
+      (block as { type?: unknown }).type === 'text' &&
+      typeof (block as { text?: unknown }).text === 'string',
+  )
+  return textBlock?.text || ''
+}
+
+function isDuplicateOfLastApiError(
+  lastApiError: SessionStreamState['lastApiError'],
+  resultMessage: string,
+): boolean {
+  if (!lastApiError?.message) return false
+  if (resultMessage === lastApiError.message) return true
+  return (
+    resultMessage.includes(lastApiError.message) &&
+    /CLI (?:process exited unexpectedly|exited during startup)/i.test(resultMessage)
+  )
 }
 
 function bindPrewarmMetadataCapture(sessionId: string) {
@@ -686,10 +864,12 @@ async function ensureCliSessionStarted(
 
   const startup = (async () => {
     const workDir = await resolveSessionWorkDir(sessionId)
+    lastResolvedStartupWorkDirs.set(sessionId, workDir)
     const runtimeSettings = await getRuntimeSettings(sessionId)
     const sdkUrl =
       `ws://${ws.data.serverHost}:${ws.data.serverPort}/sdk/${sessionId}` +
       `?token=${encodeURIComponent(crypto.randomUUID())}`
+    await sendRepositoryStartupStatus(ws, sessionId, reason)
     console.log(`[WS] Starting CLI for ${sessionId} due to ${reason}`)
     await conversationService.startSession(sessionId, workDir, sdkUrl, runtimeSettings)
   })()
@@ -708,11 +888,14 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
   const streamState = getStreamState(sessionId)
   switch (cliMsg.type) {
     case 'assistant': {
-      if (cliMsg.error) {
+      if (cliMsg.error || cliMsg.isApiErrorMessage) {
+        const message = extractAssistantText(cliMsg) || cliMsg.error || 'Unknown API error'
+        const code = typeof cliMsg.error === 'string' ? cliMsg.error : 'API_ERROR'
+        streamState.lastApiError = { message, code }
         return [{
           type: 'error',
-          message: cliMsg.message?.content?.[0]?.text || cliMsg.error,
-          code: cliMsg.error,
+          message,
+          code,
         }]
       }
 
@@ -771,6 +954,14 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
       // Bug #1: 处理 tool_result 消息
       // CLI 发送 type:'user' 消息，其中 content 包含 tool_result 块
       const messages: ServerMessage[] = []
+
+      const localCommandOutput = extractLocalCommandOutput(
+        cliMsg.message?.content,
+      )
+      if (localCommandOutput) {
+        messages.push({ type: 'content_start', blockType: 'text' })
+        messages.push({ type: 'content_delta', text: localCommandOutput })
+      }
 
       if (cliMsg.message?.content && Array.isArray(cliMsg.message.content)) {
         for (const block of cliMsg.message.content) {
@@ -947,6 +1138,10 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
           (Array.isArray(cliMsg.errors) && cliMsg.errors.length > 0
             ? cliMsg.errors.join('\n')
             : 'Unknown error')
+        if (isDuplicateOfLastApiError(streamState.lastApiError, resultMessage)) {
+          streamState.lastApiError = undefined
+          return [{ type: 'message_complete', usage }]
+        }
         // 错误和完成消息都发送
         return [
           {
@@ -960,6 +1155,7 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
 
       // Clear stop flag on successful completion too
       sessionStopRequested.delete(sessionId)
+      streamState.lastApiError = undefined
       return [{ type: 'message_complete', usage }]
     }
 
@@ -990,6 +1186,17 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
       if (subtype === 'hook_started' || subtype === 'hook_response') {
         // Hook 执行中 — 不转发给前端
         return []
+      }
+      if (subtype === 'local_command' || subtype === 'local_command_output') {
+        const localCommandOutput = extractLocalCommandOutput(
+          cliMsg.content ?? cliMsg.message,
+          { allowUntagged: subtype === 'local_command_output' },
+        )
+        if (!localCommandOutput) return []
+        return [
+          { type: 'content_start', blockType: 'text' },
+          { type: 'content_delta', text: localCommandOutput },
+        ]
       }
       // Bug #7: 处理 task/team system 消息
       if (subtype === 'task_notification') {
@@ -1022,6 +1229,14 @@ function translateCliMessage(cliMsg: any, sessionId: string): ServerMessage[] {
           data: cliMsg,
         }]
       }
+      if (subtype === 'compact_boundary') {
+        return [{
+          type: 'system_notification',
+          subtype: 'compact_boundary',
+          message: getCompactBoundaryMessage(cliMsg),
+          data: cliMsg.compact_metadata ?? cliMsg,
+        }]
+      }
       // 其他 system 消息
       return []
     }
@@ -1043,6 +1258,59 @@ function sendMessage(ws: ServerWebSocket<WebSocketData>, message: ServerMessage)
 
 function sendError(ws: ServerWebSocket<WebSocketData>, message: string, code: string) {
   sendMessage(ws, { type: 'error', message, code })
+}
+
+function getDesktopSlashCommand(content: string): ReturnType<typeof parseSlashCommand> {
+  const parsed = parseSlashCommand(content.trim())
+  if (!parsed || parsed.isMcp) return null
+  return parsed
+}
+
+function extractLocalCommandOutput(
+  content: unknown,
+  options: { allowUntagged?: boolean } = {},
+): string | null {
+  const raw = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content
+        .flatMap((block) => {
+          if (!block || typeof block !== 'object') return []
+          const text = (block as { text?: unknown }).text
+          return typeof text === 'string' ? [text] : []
+        })
+        .join('\n')
+      : ''
+
+  if (!raw) return null
+
+  const stdout = extractTaggedContent(raw, LOCAL_COMMAND_STDOUT_TAG)
+  if (stdout !== null) return stdout
+
+  const stderr = extractTaggedContent(raw, LOCAL_COMMAND_STDERR_TAG)
+  if (stderr !== null) return stderr
+
+  if (options.allowUntagged) {
+    const normalized = raw.trim()
+    return normalized || null
+  }
+
+  return null
+}
+
+function extractTaggedContent(raw: string, tag: string): string | null {
+  const match = raw.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`))
+  return match?.[1]?.trim() ?? null
+}
+
+function getCompactBoundaryMessage(cliMsg: any): string {
+  const message = typeof cliMsg?.message === 'string' ? cliMsg.message.trim() : ''
+  if (message) return message
+
+  const content = typeof cliMsg?.content === 'string' ? cliMsg.content.trim() : ''
+  if (content) return content
+
+  return 'Context compacted'
 }
 
 function rebindSessionOutput(
@@ -1071,32 +1339,60 @@ function rebindSessionOutput(
   })
 }
 
-async function getRuntimeSettings(sessionId?: string): Promise<{
+type RuntimeSettings = {
   permissionMode?: string
   model?: string
   effort?: string
+  thinking?: 'disabled'
   providerId?: string | null
-}> {
+}
+
+async function getRuntimeSettings(sessionId?: string): Promise<RuntimeSettings> {
   const runtimeOverride = sessionId ? runtimeOverrides.get(sessionId) : undefined
   if (runtimeOverride) {
+    if (typeof runtimeOverride.providerId === 'string') {
+      const { providers } = await providerService.listProviders()
+      const providerExists = providers.some((provider) => provider.id === runtimeOverride.providerId)
+      if (!providerExists) {
+        console.warn(
+          `[WS] Ignoring stale runtime provider id for ${sessionId}: ${runtimeOverride.providerId}`,
+        )
+        runtimeOverrides.delete(sessionId!)
+        return getDefaultRuntimeSettings()
+      }
+    }
+
     const userSettings = await settingsService.getUserSettings()
     const effort =
       typeof userSettings.effort === 'string' && userSettings.effort.trim()
         ? userSettings.effort
         : undefined
+    const thinking = resolveDesktopThinkingMode(userSettings)
 
     return {
       permissionMode: await settingsService.getPermissionMode().catch(() => undefined),
       model: runtimeOverride.modelId,
       effort,
+      thinking,
       providerId: runtimeOverride.providerId,
     }
   }
 
+  return getDefaultRuntimeSettings()
+}
+
+async function getDefaultRuntimeSettings(): Promise<RuntimeSettings> {
   // Check if a custom provider is active
-  const { activeId } = await providerService.listProviders()
+  const { providers, activeId } = await providerService.listProviders()
+  let resolvedActiveId = activeId
+  if (activeId && !providers.some((provider) => provider.id === activeId)) {
+    console.warn(`[WS] Active provider id is stale, falling back to official provider: ${activeId}`)
+    resolvedActiveId = null
+    await providerService.activateOfficial()
+  }
+
   const userSettings = await settingsService.getUserSettings()
-  const providerSettings = activeId
+  const providerSettings = resolvedActiveId
     ? await providerService.getManagedSettings()
     : undefined
   const modelSettings = providerSettings ?? userSettings
@@ -1108,9 +1404,10 @@ async function getRuntimeSettings(sessionId?: string): Promise<{
     typeof userSettings.effort === 'string' && userSettings.effort.trim()
       ? userSettings.effort
       : undefined
+  const thinking = resolveDesktopThinkingMode(userSettings)
 
   let model: string | undefined
-  if (activeId) {
+  if (resolvedActiveId) {
     // Provider is active — only consult provider-managed cc-haha settings.
     // Global ~/.claude/settings.json model values must not bleed into provider mode.
     const baseModel =
@@ -1134,7 +1431,63 @@ async function getRuntimeSettings(sessionId?: string): Promise<{
     permissionMode: await settingsService.getPermissionMode().catch(() => undefined),
     model,
     effort,
+    thinking,
+    providerId: resolvedActiveId,
   }
+}
+
+function resolveDesktopThinkingMode(
+  settings: Record<string, unknown>,
+): 'disabled' | undefined {
+  return settings.alwaysThinkingEnabled === false ? 'disabled' : undefined
+}
+
+async function buildSessionStartupDiagnosticMessage(
+  sessionId: string,
+  cause: string,
+): Promise<string> {
+  const lines = [
+    cause,
+    '',
+    'Desktop service diagnostics:',
+    `- sessionId: ${sessionId}`,
+  ]
+
+  try {
+    const recentWorkDir = lastResolvedStartupWorkDirs.get(sessionId)
+    const workDir =
+      recentWorkDir ||
+      conversationService.getSessionWorkDir(sessionId) ||
+      await sessionService.getSessionWorkDir(sessionId)
+    lines.push(`- workDir: ${workDir ?? '(unknown)'}`)
+  } catch (err) {
+    lines.push(`- workDir: failed to resolve (${err instanceof Error ? err.message : String(err)})`)
+  }
+
+  const runtimeOverride = runtimeOverrides.get(sessionId)
+  if (runtimeOverride) {
+    lines.push(`- runtimeOverride.providerId: ${runtimeOverride.providerId ?? '(official)'}`)
+    lines.push(`- runtimeOverride.modelId: ${runtimeOverride.modelId}`)
+  } else {
+    lines.push('- runtimeOverride: (none)')
+  }
+
+  try {
+    const { providers, activeId } = await providerService.listProviders()
+    lines.push(`- activeProviderId: ${activeId ?? '(official)'}`)
+    lines.push(`- configuredProviders: ${providers.length}`)
+    if (providers.length > 0) {
+      lines.push(
+        `- providerIndex: ${providers
+          .map((provider) => `${provider.name} (${provider.id})`)
+          .join(', ')}`,
+      )
+    }
+  } catch (err) {
+    lines.push(`- providers: failed to read (${err instanceof Error ? err.message : String(err)})`)
+  }
+
+  return lines.join('\n')
 }
 
 function enqueueRuntimeTransition(
@@ -1154,6 +1507,45 @@ function enqueueRuntimeTransition(
   return next
 }
 
+async function waitForRuntimeTransitionBeforeUserTurn(
+  ws: ServerWebSocket<WebSocketData>,
+  sessionId: string,
+): Promise<{ ok: boolean; waited: boolean }> {
+  let waited = false
+  let pendingRuntimeTransition = runtimeTransitionPromises.get(sessionId)
+  while (pendingRuntimeTransition) {
+    waited = true
+    try {
+      await pendingRuntimeTransition
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err)
+      void diagnosticsService.recordEvent({
+        type: 'runtime_transition_failed',
+        severity: 'error',
+        sessionId,
+        summary: errMsg,
+        details: err,
+      })
+      console.error(`[WS] Runtime transition failed before handling user message for ${sessionId}: ${errMsg}`)
+      sendMessage(ws, {
+        type: 'error',
+        message: `Failed to switch provider/model: ${errMsg}`,
+        code: 'CLI_RESTART_FAILED',
+      })
+      sendMessage(ws, { type: 'status', state: 'idle' })
+      return { ok: false, waited }
+    }
+
+    const nextTransition = runtimeTransitionPromises.get(sessionId)
+    pendingRuntimeTransition =
+      nextTransition && nextTransition !== pendingRuntimeTransition
+        ? nextTransition
+        : undefined
+  }
+
+  return { ok: true, waited }
+}
+
 /**
  * Send a message to a specific session's WebSocket (for use by services)
  */
@@ -1164,6 +1556,32 @@ export function sendToSession(sessionId: string, message: ServerMessage): boolea
   return true
 }
 
+export function closeSessionConnection(sessionId: string, reason = 'session closed'): boolean {
+  const cleanupTimer = sessionCleanupTimers.get(sessionId)
+  if (cleanupTimer) {
+    clearTimeout(cleanupTimer)
+    sessionCleanupTimers.delete(sessionId)
+  }
+  computerUseApprovalService.cancelSession(sessionId)
+  conversationService.clearOutputCallbacks(sessionId)
+  cleanupSessionRuntimeState(sessionId)
+
+  const ws = activeSessions.get(sessionId)
+  if (!ws) return false
+
+  activeSessions.delete(sessionId)
+  ws.close(1000, reason)
+  return true
+}
+
 export function getActiveSessionIds(): string[] {
   return Array.from(activeSessions.keys())
+}
+
+export function __resetWebSocketHandlerStateForTests(): void {
+  for (const timer of sessionCleanupTimers.values()) clearTimeout(timer)
+  for (const timer of prewarmIdleTimers.values()) clearTimeout(timer)
+  activeSessions.clear()
+  sessionCleanupTimers.clear()
+  prewarmIdleTimers.clear()
 }

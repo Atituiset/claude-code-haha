@@ -11,10 +11,22 @@ import * as os from 'node:os'
 import * as path from 'node:path'
 import { ProviderService } from './providerService.js'
 import { sessionService } from './sessionService.js'
+import { diagnosticsService } from './diagnosticsService.js'
+import {
+  isMaterializedWorktreeLaunch,
+  prepareSessionWorkspace,
+  shouldCreateWorktreeForSessionLaunch,
+  type PreparedSessionWorkspace,
+} from './repositoryLaunchService.js'
 import {
   buildClaudeCliArgs,
   resolveClaudeCliLauncher,
 } from '../../utils/desktopBundledCli.js'
+
+const MAX_CAPTURED_PROCESS_LINES = 80
+const MAX_CAPTURED_SDK_MESSAGES = 40
+const MAX_CAPTURED_SDK_SUMMARY = 20
+const CONTROL_READY_POLL_MS = 50
 
 type AttachmentRef = {
   type: 'file' | 'image'
@@ -32,8 +44,13 @@ type SessionProcess = {
   sdkToken: string
   sdkSocket: { send(data: string): void } | null
   pendingOutbound: string[]
+  startupPending: boolean
+  startupExitCode: number | null
+  stdoutLines: string[]
   stderrLines: string[]
+  outputDrain: Promise<void>
   sdkMessages: any[]
+  initMessage: any | null
   pendingPermissionRequests: Map<
     string,
     {
@@ -48,6 +65,7 @@ type SessionStartOptions = {
   permissionMode?: string
   model?: string
   effort?: string
+  thinking?: 'enabled' | 'adaptive' | 'disabled'
   providerId?: string | null
 }
 
@@ -59,7 +77,8 @@ export class ConversationStartupError extends Error {
       | 'CLI_AUTH_REQUIRED'
       | 'CLI_SESSION_CONFLICT'
       | 'CLI_START_FAILED'
-      | 'CLI_SPAWN_FAILED',
+      | 'CLI_SPAWN_FAILED'
+      | 'SESSION_DELETED',
     readonly retryable = false,
   ) {
     super(message)
@@ -69,6 +88,7 @@ export class ConversationStartupError extends Error {
 
 export class ConversationService {
   private sessions = new Map<string, SessionProcess>()
+  private deletedSessions = new Set<string>()
   private providerService = new ProviderService()
 
   private buildSessionCliArgs(
@@ -76,8 +96,19 @@ export class ConversationService {
     sdkUrl: string,
     shouldResume: boolean,
     options?: SessionStartOptions,
+    repository?: PreparedSessionWorkspace['repository'],
   ): string[] {
     const dangerousMode = process.env.CLAUDE_DANGEROUS_MODE === '1'
+    const worktreeArgs =
+      !shouldResume && repository?.worktree
+        ? [
+            '--worktree',
+            repository.worktreeSlug || repository.worktreeBranch || repository.branch,
+            '--worktree-base-ref',
+            repository.baseRef,
+          ]
+        : []
+
     return this.resolveCliArgs([
       '--print',
       '--verbose',
@@ -92,6 +123,7 @@ export class ConversationService {
       // server only sees the completed assistant message at turn end.
       '--include-partial-messages',
       ...(shouldResume ? ['--resume', sessionId] : ['--session-id', sessionId]),
+      ...worktreeArgs,
       '--replay-user-messages',
       ...this.getRuntimeArgs(options),
       ...this.getPermissionArgs(options?.permissionMode, dangerousMode),
@@ -104,15 +136,28 @@ export class ConversationService {
     sdkUrl: string,
     options?: SessionStartOptions,
   ): Promise<void> {
+    if (this.deletedSessions.has(sessionId)) {
+      throw new ConversationStartupError(
+        `Session was deleted before startup completed: ${sessionId}`,
+        'SESSION_DELETED',
+      )
+    }
     if (this.sessions.has(sessionId)) return
 
     const launchInfo = await sessionService.getSessionLaunchInfo(sessionId)
     const shouldResume = !!launchInfo && launchInfo.transcriptMessageCount > 0
     const shouldReplacePlaceholder =
       !!launchInfo && launchInfo.transcriptMessageCount === 0
+    const shouldCreateWorktree =
+      !!launchInfo && shouldCreateWorktreeForSessionLaunch(launchInfo)
+    const hasMaterializedWorktree =
+      !!launchInfo && isMaterializedWorktreeLaunch(launchInfo)
 
-    if (shouldReplacePlaceholder) {
-      await sessionService.deleteSessionFile(sessionId)
+    if (this.deletedSessions.has(sessionId)) {
+      throw new ConversationStartupError(
+        `Session was deleted before startup completed: ${sessionId}`,
+        'SESSION_DELETED',
+      )
     }
 
     if (!fs.existsSync(workDir) || !fs.statSync(workDir).isDirectory()) {
@@ -122,15 +167,51 @@ export class ConversationService {
       )
     }
 
+    if (shouldReplacePlaceholder) {
+      await sessionService.clearSessionTranscript(sessionId, workDir)
+    }
+
+    let launchWorkDir = workDir
+    let launchRepository = launchInfo?.repository
+    if (shouldCreateWorktree && launchRepository?.worktree) {
+      launchWorkDir = launchRepository.requestedWorkDir || launchRepository.repoRoot || workDir
+    } else if (!shouldResume && launchRepository && !hasMaterializedWorktree) {
+      const preparedWorkspace = await prepareSessionWorkspace(
+        workDir,
+        {
+          branch: launchRepository.branch,
+          worktree: false,
+        },
+        sessionId,
+      )
+      launchWorkDir = preparedWorkspace.workDir
+      launchRepository = preparedWorkspace.repository
+    }
+
+    if (!shouldCreateWorktree && launchRepository?.worktree) {
+      launchRepository = {
+        ...launchRepository,
+        worktree: false,
+      }
+    }
+
+    if (!fs.existsSync(launchWorkDir) || !fs.statSync(launchWorkDir).isDirectory()) {
+      throw new ConversationStartupError(
+        `Working directory does not exist or is not a directory: ${launchWorkDir}`,
+        'WORKDIR_INVALID',
+      )
+    }
+
     const args = this.buildSessionCliArgs(
       sessionId,
       sdkUrl,
       shouldResume,
       options,
+      launchRepository,
     )
 
     console.log(
-      `[ConversationService] Starting CLI for ${sessionId}, cwd: ${workDir} (process.cwd()=${process.cwd()}, CALLER_DIR will be pinned to workDir)`,
+      `[ConversationService] Starting CLI for ${sessionId}, cwd: ${launchWorkDir} (process.cwd()=${process.cwd()}, CALLER_DIR will be pinned to workDir)`,
     )
 
     // IMPORTANT (Bug#5): 必须覆盖子进程继承的 CALLER_DIR / PWD。
@@ -143,20 +224,33 @@ export class ConversationService {
     // 工作目录就变成 `/`。把 CALLER_DIR / PWD 显式覆盖成 workDir，preload.ts
     // chdir 后落到正确目录。
     //
-    const childEnv = await this.buildChildEnv(workDir, sdkUrl, options)
+    const childEnv = await this.buildChildEnv(launchWorkDir, sdkUrl, options)
 
     let proc: ReturnType<typeof Bun.spawn>
     try {
       proc = Bun.spawn(args, {
-        cwd: workDir,
+        cwd: launchWorkDir,
         env: childEnv,
         stdin: 'pipe',
-        stdout: 'ignore',  // CLI communicates via SDK WebSocket, not stdout
+        stdout: 'pipe',
         stderr: 'pipe',
       })
     } catch (spawnErr) {
+      void diagnosticsService.recordEvent({
+        type: 'cli_spawn_failed',
+        severity: 'error',
+        sessionId,
+        summary: spawnErr instanceof Error ? spawnErr.message : String(spawnErr),
+        details: {
+          workDir,
+          permissionMode: options?.permissionMode || 'default',
+          providerId: options?.providerId ?? null,
+          model: options?.model ?? null,
+          error: spawnErr,
+        },
+      })
       throw new ConversationStartupError(
-        `Failed to spawn CLI in ${workDir}: ${
+        `Failed to spawn CLI in ${launchWorkDir}: ${
           spawnErr instanceof Error ? spawnErr.message : String(spawnErr)
         }`,
         'CLI_SPAWN_FAILED',
@@ -166,21 +260,29 @@ export class ConversationService {
     const session: SessionProcess = {
       proc,
       outputCallbacks: [],
-      workDir,
+      workDir: launchWorkDir,
       permissionMode: options?.permissionMode || 'default',
       sdkToken: this.getSdkTokenFromUrl(sdkUrl),
       sdkSocket: null,
       pendingOutbound: [],
+      startupPending: true,
+      startupExitCode: null,
+      stdoutLines: [],
       stderrLines: [],
+      outputDrain: Promise.resolve(),
       sdkMessages: [],
+      initMessage: null,
       pendingPermissionRequests: new Map(),
     }
     this.sessions.set(sessionId, session)
 
-    this.readErrorStream(sessionId, proc)
+    session.outputDrain = Promise.all([
+      this.readProcessOutputStream(sessionId, proc.stdout, 'stdout'),
+      this.readProcessOutputStream(sessionId, proc.stderr, 'stderr'),
+    ]).then(() => undefined)
 
     proc.exited.then((code) => {
-      this.handleProcessExit(sessionId, proc, code)
+      void this.handleProcessExit(sessionId, proc, code)
     })
 
     const STARTUP_GRACE_MS = 3000
@@ -191,8 +293,10 @@ export class ConversationService {
       ),
     ])
 
-    if (earlyExitCode !== null) {
-      const startupError = this.buildStartupError(sessionId, earlyExitCode)
+    const startupExitCode = earlyExitCode ?? session.startupExitCode
+    if (startupExitCode !== null) {
+      await this.waitForProcessOutputDrain(session)
+      const startupError = this.buildStartupError(sessionId, startupExitCode)
       this.sessions.delete(sessionId)
 
       if (this.clearStaleLock(sessionId)) {
@@ -203,15 +307,35 @@ export class ConversationService {
       }
 
       console.error(
-        `[ConversationService] CLI exited with code ${earlyExitCode} for ${sessionId}: ${startupError.message}`,
+        `[ConversationService] CLI exited with code ${startupExitCode} for ${sessionId}: ${startupError.message}`,
       )
+      void diagnosticsService.recordEvent({
+        type: 'cli_start_failed',
+        severity: 'error',
+        sessionId,
+        summary: startupError.message,
+        details: {
+          code: startupError.code,
+          exitCode: startupExitCode,
+          retryable: startupError.retryable,
+          workDir: launchWorkDir,
+          permissionMode: options?.permissionMode || 'default',
+          providerId: options?.providerId ?? null,
+          model: options?.model ?? null,
+          capturedOutput: this.buildCapturedProcessOutputDetail(session),
+          sdkMessages: this.summarizeSdkMessages(session.sdkMessages),
+        },
+      })
       throw startupError
     }
 
+    session.startupPending = false
+
     if (shouldReplacePlaceholder || !launchInfo) {
       await sessionService.appendSessionMetadata(sessionId, {
-        workDir,
+        workDir: launchWorkDir,
         customTitle: launchInfo?.customTitle ?? null,
+        repository: launchRepository,
       })
     }
 
@@ -232,8 +356,18 @@ export class ConversationService {
     }
   }
 
+  removeOutputCallback(sessionId: string, callback: (msg: any) => void): void {
+    const session = this.sessions.get(sessionId)
+    if (!session) return
+    session.outputCallbacks = session.outputCallbacks.filter((entry) => entry !== callback)
+  }
+
   getRecentSdkMessages(sessionId: string): any[] {
     return [...(this.sessions.get(sessionId)?.sdkMessages ?? [])]
+  }
+
+  getSessionInitMessage(sessionId: string): any | null {
+    return this.sessions.get(sessionId)?.initMessage ?? null
   }
 
   sendMessage(
@@ -309,6 +443,87 @@ export class ConversationService {
     })
   }
 
+  private isControlChannelReady(session: SessionProcess): boolean {
+    return Boolean(session.sdkSocket)
+  }
+
+  private async waitForControlChannelReady(
+    sessionId: string,
+    timeoutMs: number,
+  ): Promise<void> {
+    const startedAt = Date.now()
+
+    while (Date.now() - startedAt < timeoutMs) {
+      const session = this.sessions.get(sessionId)
+      if (!session) {
+        throw new Error('CLI session is not running')
+      }
+      if (this.isControlChannelReady(session)) {
+        return
+      }
+      await new Promise((resolve) => setTimeout(resolve, CONTROL_READY_POLL_MS))
+    }
+
+    throw new Error('Timed out waiting for CLI control channel to become ready')
+  }
+
+  async requestControl(
+    sessionId: string,
+    request: Record<string, unknown>,
+    timeoutMs = 10_000,
+  ): Promise<Record<string, unknown>> {
+    if (!this.sessions.has(sessionId)) {
+      return Promise.reject(new Error('CLI session is not running'))
+    }
+
+    const startedAt = Date.now()
+    await this.waitForControlChannelReady(sessionId, timeoutMs)
+    const responseTimeoutMs = Math.max(1, timeoutMs - (Date.now() - startedAt))
+    const requestId = crypto.randomUUID()
+    return new Promise((resolve, reject) => {
+      const timeout = setTimeout(() => {
+        this.removeOutputCallback(sessionId, handleOutput)
+        reject(new Error(`Timed out waiting for ${String(request.subtype ?? 'control')} response`))
+      }, responseTimeoutMs)
+
+      const finish = (fn: () => void) => {
+        clearTimeout(timeout)
+        this.removeOutputCallback(sessionId, handleOutput)
+        fn()
+      }
+
+      const handleOutput = (msg: any) => {
+        if (
+          msg?.type !== 'control_response' ||
+          msg.response?.request_id !== requestId
+        ) {
+          return
+        }
+
+        if (msg.response.subtype === 'error') {
+          finish(() => reject(new Error(String(msg.response.error || 'Control request failed'))))
+          return
+        }
+
+        finish(() => resolve(
+          msg.response.response && typeof msg.response.response === 'object'
+            ? msg.response.response as Record<string, unknown>
+            : {},
+        ))
+      }
+
+      this.onOutput(sessionId, handleOutput)
+      const sent = this.sendSdkMessage(sessionId, {
+        type: 'control_request',
+        request_id: requestId,
+        request,
+      })
+      if (!sent) {
+        finish(() => reject(new Error('CLI session is not running')))
+      }
+    })
+  }
+
   hasSession(sessionId: string): boolean {
     return this.sessions.has(sessionId)
   }
@@ -316,6 +531,12 @@ export class ConversationService {
   getSessionWorkDir(sessionId: string): string {
     const session = this.sessions.get(sessionId)
     return session?.workDir || ''
+  }
+
+  updateSessionWorkDir(sessionId: string, workDir: string): void {
+    const session = this.sessions.get(sessionId)
+    if (!session || !workDir.trim()) return
+    session.workDir = workDir
   }
 
   getSessionPermissionMode(sessionId: string): string {
@@ -368,8 +589,21 @@ export class ConversationService {
       try {
         const msg = JSON.parse(line)
         session.sdkMessages.push(msg)
-        if (session.sdkMessages.length > 40) {
-          session.sdkMessages.splice(0, 20)
+        if (session.sdkMessages.length > MAX_CAPTURED_SDK_MESSAGES) {
+          session.sdkMessages.splice(0, session.sdkMessages.length - MAX_CAPTURED_SDK_MESSAGES)
+        }
+        const sdkError = this.extractSdkErrorEvent(msg)
+        if (sdkError) {
+          void diagnosticsService.recordEvent({
+            type: sdkError.type,
+            severity: 'error',
+            sessionId,
+            summary: sdkError.summary,
+            details: sdkError.details,
+          })
+        }
+        if (msg?.type === 'system' && msg.subtype === 'init') {
+          session.initMessage = msg
         }
         if (
           msg?.type === 'control_request' &&
@@ -409,17 +643,41 @@ export class ConversationService {
     }
   }
 
+  async stopSessionAndWait(sessionId: string, timeoutMs = 2_000): Promise<void> {
+    const session = this.sessions.get(sessionId)
+    if (!session) return
+
+    this.sessions.delete(sessionId)
+    session.proc.kill()
+
+    await Promise.race([
+      session.proc.exited.catch(() => undefined),
+      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+    ])
+    await this.waitForProcessOutputDrain(session, timeoutMs)
+  }
+
+  markSessionDeleted(sessionId: string): void {
+    this.deletedSessions.add(sessionId)
+    this.stopSession(sessionId)
+  }
+
+  unmarkSessionDeleted(sessionId: string): void {
+    this.deletedSessions.delete(sessionId)
+  }
+
   getActiveSessions(): string[] {
     return Array.from(this.sessions.keys())
   }
 
-  private async readErrorStream(
+  private async readProcessOutputStream(
     sessionId: string,
-    proc: ReturnType<typeof Bun.spawn>,
+    stream: ReadableStream | null | undefined,
+    streamName: 'stdout' | 'stderr',
   ): Promise<void> {
-    if (!proc.stderr) return
+    if (!stream) return
 
-    const reader = (proc.stderr as ReadableStream).getReader()
+    const reader = stream.getReader()
     const decoder = new TextDecoder()
 
     try {
@@ -436,18 +694,36 @@ export class ConversationService {
             .split('\n')
             .map((entry) => entry.trim())
             .filter(Boolean)) {
-            session.stderrLines.push(line)
-            if (session.stderrLines.length > 20) {
-              session.stderrLines.splice(0, 10)
+            const lines =
+              streamName === 'stderr' ? session.stderrLines : session.stdoutLines
+            lines.push(this.redactProcessOutput(line))
+            if (lines.length > MAX_CAPTURED_PROCESS_LINES) {
+              lines.splice(0, lines.length - MAX_CAPTURED_PROCESS_LINES)
             }
           }
         }
 
-        console.error(`[CLI:${sessionId}] ${text.trim()}`)
+        const logLine = this.redactProcessOutput(text.trim())
+        if (streamName === 'stderr') {
+          console.error(`[CLI:${sessionId}:stderr] ${logLine}`)
+        } else {
+          console.log(`[CLI:${sessionId}:stdout] ${logLine}`)
+        }
       }
     } catch {
-      // stderr read failures should not kill the session
+      // Process output read failures should not kill the session.
     }
+  }
+
+  private async waitForProcessOutputDrain(
+    session: SessionProcess,
+    timeoutMs = 250,
+  ): Promise<void> {
+    const outputDrain = session.outputDrain ?? Promise.resolve()
+    await Promise.race([
+      outputDrain.catch(() => undefined),
+      new Promise<void>((resolve) => setTimeout(resolve, timeoutMs)),
+    ])
   }
 
   private sendSdkMessage(
@@ -466,17 +742,46 @@ export class ConversationService {
     return true
   }
 
-  private handleProcessExit(
+  private async handleProcessExit(
     sessionId: string,
     proc: SessionProcess['proc'],
     code: number,
-  ): void {
+  ): Promise<void> {
     console.log(
       `[ConversationService] CLI process for ${sessionId} exited with code ${code}`,
     )
 
     const activeSession = this.sessions.get(sessionId)
     if (activeSession?.proc === proc) {
+      if (activeSession.startupPending) {
+        activeSession.startupExitCode = code
+        return
+      }
+      await this.waitForProcessOutputDrain(activeSession)
+      const exitError = this.buildRuntimeExitMessage(sessionId, code)
+      void diagnosticsService.recordEvent({
+        type: 'cli_runtime_exit',
+        severity: 'error',
+        sessionId,
+        summary: exitError,
+        details: {
+          exitCode: code,
+          workDir: activeSession.workDir,
+          permissionMode: activeSession.permissionMode,
+          capturedOutput: this.buildCapturedProcessOutputDetail(activeSession),
+          sdkMessages: this.summarizeSdkMessages(activeSession.sdkMessages),
+        },
+      })
+      for (const cb of activeSession.outputCallbacks) {
+        cb({
+          type: 'result',
+          subtype: 'error',
+          is_error: true,
+          result: exitError,
+          usage: { input_tokens: 0, output_tokens: 0 },
+          session_id: sessionId,
+        })
+      }
       this.sessions.delete(sessionId)
     }
   }
@@ -509,6 +814,10 @@ export class ConversationService {
       args.push('--effort', options.effort)
     }
 
+    if (options?.thinking) {
+      args.push('--thinking', options.thinking)
+    }
+
     return args
   }
 
@@ -530,8 +839,14 @@ export class ConversationService {
       'ANTHROPIC_AUTH_TOKEN',
       'ANTHROPIC_MODEL',
       'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+      'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
       'ANTHROPIC_DEFAULT_SONNET_MODEL',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES',
       'ANTHROPIC_DEFAULT_OPUS_MODEL',
+      'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
+      'CC_HAHA_SEND_DISABLED_THINKING',
+      'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+      'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS',
     ] as const
 
     const cleanEnv = { ...process.env }
@@ -560,10 +875,18 @@ export class ConversationService {
       explicitProviderEnv.ANTHROPIC_MODEL = options.model.trim()
     }
 
+    const cliDiagnosticsPath = diagnosticsService.getCliDiagnosticsPath()
+    try {
+      fs.mkdirSync(path.dirname(cliDiagnosticsPath), { recursive: true })
+    } catch {
+      // Diagnostics must never block session startup.
+    }
+
     return {
       ...cleanEnv,
       CLAUDE_CODE_ENABLE_TASKS: '1',
       CLAUDE_CODE_ENABLE_SDK_FILE_CHECKPOINTING: '1',
+      CLAUDE_CODE_DIAGNOSTICS_FILE: cliDiagnosticsPath,
       CALLER_DIR: workDir,
       PWD: workDir,
       ...(sdkUrl
@@ -650,8 +973,14 @@ export class ConversationService {
         'ANTHROPIC_AUTH_TOKEN',
         'ANTHROPIC_MODEL',
         'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+        'ANTHROPIC_DEFAULT_HAIKU_MODEL_SUPPORTED_CAPABILITIES',
         'ANTHROPIC_DEFAULT_SONNET_MODEL',
+        'ANTHROPIC_DEFAULT_SONNET_MODEL_SUPPORTED_CAPABILITIES',
         'ANTHROPIC_DEFAULT_OPUS_MODEL',
+        'ANTHROPIC_DEFAULT_OPUS_MODEL_SUPPORTED_CAPABILITIES',
+        'CC_HAHA_SEND_DISABLED_THINKING',
+        'CLAUDE_CODE_AUTO_COMPACT_WINDOW',
+        'CLAUDE_CODE_MODEL_CONTEXT_WINDOWS',
       ].some((key) => typeof env[key] === 'string' && env[key]!.trim().length > 0)
     } catch {
       return false
@@ -741,18 +1070,22 @@ export class ConversationService {
     exitCode: number,
   ): ConversationStartupError {
     const session = this.sessions.get(sessionId)
-    const stderrText = session?.stderrLines.join('\n') ?? ''
+    const capturedOutput = this.buildCapturedProcessOutputDetail(session)
     const recentMessages = session?.sdkMessages ?? []
     const resultMessage = [...recentMessages]
       .reverse()
       .find((msg) => msg?.type === 'result' && msg.is_error)
+    const assistantApiError = [...recentMessages]
+      .reverse()
+      .find((msg) => this.isAssistantApiErrorMessage(msg))
     const authStatus = [...recentMessages]
       .reverse()
       .find((msg) => msg?.type === 'auth_status')
     const detail =
       this.extractStartupDetail(resultMessage) ||
+      this.extractAssistantApiErrorDetail(assistantApiError) ||
       this.extractStartupDetail(authStatus) ||
-      stderrText
+      capturedOutput
 
     if (
       /(not logged in|run \/login|sign in again|login required|unauthenticated|logged_out)/i.test(
@@ -777,10 +1110,56 @@ export class ConversationService {
     return new ConversationStartupError(
       normalizedDetail
         ? `CLI exited during startup (code ${exitCode}): ${normalizedDetail}`
-        : `CLI exited during startup with code ${exitCode}.`,
+        : `CLI exited during startup with code ${exitCode}; no CLI stderr/stdout or SDK error payload was captured before exit.`,
       'CLI_START_FAILED',
       true,
     )
+  }
+
+  private buildRuntimeExitMessage(sessionId: string, exitCode: number): string {
+    const session = this.sessions.get(sessionId)
+    const capturedOutput = this.buildCapturedProcessOutputDetail(session)
+    const recentMessages = session?.sdkMessages ?? []
+    const resultMessage = [...recentMessages]
+      .reverse()
+      .find((msg) => msg?.type === 'result' && msg.is_error)
+    const assistantApiError = [...recentMessages]
+      .reverse()
+      .find((msg) => this.isAssistantApiErrorMessage(msg))
+    const authStatus = [...recentMessages]
+      .reverse()
+      .find((msg) => msg?.type === 'auth_status')
+    const detail =
+      this.extractStartupDetail(resultMessage) ||
+      this.extractAssistantApiErrorDetail(assistantApiError) ||
+      this.extractStartupDetail(authStatus) ||
+      capturedOutput
+
+    return detail
+      ? `CLI process exited unexpectedly (code ${exitCode}): ${detail}`
+      : `CLI process exited unexpectedly with code ${exitCode}; no CLI stderr/stdout or SDK error payload was captured before exit.`
+  }
+
+  private buildCapturedProcessOutputDetail(
+    session: SessionProcess | undefined,
+  ): string {
+    if (!session) return ''
+
+    const stderrText = (session.stderrLines ?? []).join('\n').trim()
+    const stdoutText = (session.stdoutLines ?? []).join('\n').trim()
+
+    if (stderrText && stdoutText) {
+      return `stderr:\n${stderrText}\nstdout:\n${stdoutText}`
+    }
+
+    return stderrText || stdoutText
+  }
+
+  private redactProcessOutput(line: string): string {
+    return line
+      .replace(/(ANTHROPIC_(?:API_KEY|AUTH_TOKEN)\s*[:=]\s*)[^\s,;]+/gi, '$1[REDACTED]')
+      .replace(/((?:api[_-]?key|auth[_-]?token|access[_-]?token)\s*[:=]\s*)[^\s,;]+/gi, '$1[REDACTED]')
+      .replace(/(Bearer\s+)[A-Za-z0-9._~+/-]+/gi, '$1[REDACTED]')
   }
 
   private extractStartupDetail(message: any): string {
@@ -797,6 +1176,124 @@ export class ConversationService {
     }
 
     return ''
+  }
+
+  private isAssistantApiErrorMessage(message: any): boolean {
+    return (
+      message?.type === 'assistant' &&
+      (message.isApiErrorMessage === true || typeof message.error === 'string')
+    )
+  }
+
+  private extractAssistantApiErrorDetail(message: any): string {
+    if (!this.isAssistantApiErrorMessage(message)) return ''
+
+    const text = this.extractAssistantText(message)
+    const error = typeof message.error === 'string' ? message.error : ''
+    if (text && error) return `${error}: ${text}`
+    return text || error
+  }
+
+  private extractAssistantText(message: any): string {
+    const content = message?.message?.content
+    if (!Array.isArray(content)) return ''
+    const textBlock = content.find(
+      (block: unknown): block is { type: string; text: string } =>
+        !!block &&
+        typeof block === 'object' &&
+        (block as { type?: unknown }).type === 'text' &&
+        typeof (block as { text?: unknown }).text === 'string',
+    )
+    return textBlock?.text || ''
+  }
+
+  private extractSdkErrorEvent(message: any): {
+    type: string
+    summary: string
+    details: Record<string, unknown>
+  } | null {
+    if (this.isAssistantApiErrorMessage(message)) {
+      const summary = this.redactProcessOutput(
+        this.extractAssistantApiErrorDetail(message) || 'Assistant API error',
+      )
+      return {
+        type: 'sdk_api_error',
+        summary,
+        details: {
+          sdkType: message.type,
+          error: typeof message.error === 'string' ? message.error : undefined,
+          isApiErrorMessage: message.isApiErrorMessage === true,
+          messageText: this.extractAssistantText(message)
+            ? this.redactProcessOutput(this.extractAssistantText(message))
+            : undefined,
+          errorDetails:
+            typeof message.errorDetails === 'string'
+              ? this.redactProcessOutput(message.errorDetails)
+              : undefined,
+        },
+      }
+    }
+
+    if (message?.type === 'result' && message.is_error) {
+      const summary = this.redactProcessOutput(
+        this.extractStartupDetail(message) || 'SDK result error',
+      )
+      return {
+        type: 'sdk_result_error',
+        summary,
+        details: {
+          sdkType: message.type,
+          subtype: message.subtype,
+          isError: true,
+          result:
+            typeof message.result === 'string'
+              ? this.redactProcessOutput(message.result)
+              : undefined,
+          status:
+            typeof message.status === 'string'
+              ? this.redactProcessOutput(message.status)
+              : undefined,
+          usage: message.usage,
+        },
+      }
+    }
+
+    return null
+  }
+
+  private summarizeSdkMessages(messages: any[]): unknown[] {
+    return messages.slice(-MAX_CAPTURED_SDK_SUMMARY).map((message) => {
+      if (!message || typeof message !== 'object') {
+        return message
+      }
+      const content = Array.isArray(message.message?.content)
+        ? message.message.content.map((block: unknown) => {
+            if (!block || typeof block !== 'object') return block
+            const typedBlock = block as Record<string, unknown>
+            return {
+              type: typedBlock.type,
+              text:
+                typeof typedBlock.text === 'string'
+                  ? this.redactProcessOutput(typedBlock.text)
+                  : undefined,
+            }
+          })
+        : undefined
+      return {
+        type: message.type,
+        subtype: message.subtype,
+        is_error: message.is_error,
+        status: typeof message.status === 'string' ? message.status : undefined,
+        result: typeof message.result === 'string' ? this.redactProcessOutput(message.result) : undefined,
+        error: typeof message.error === 'string' ? this.redactProcessOutput(message.error) : undefined,
+        errorDetails:
+          typeof message.errorDetails === 'string'
+            ? this.redactProcessOutput(message.errorDetails)
+            : undefined,
+        message: typeof message.message === 'string' ? this.redactProcessOutput(message.message) : undefined,
+        content,
+      }
+    })
   }
 
   private buildUserContent(

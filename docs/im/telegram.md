@@ -61,6 +61,7 @@ Telegram 方案适合个人私聊远程使用。当前实现只处理 `private c
 当 Claude 请求敏感权限时，Telegram adapter 会发带按钮的消息：
 
 - `✅ 允许`
+- `♾️ 永久允许`
 - `❌ 拒绝`
 
 点击后 adapter 会把结果通过 `permission_response` 回传给 Desktop server。
