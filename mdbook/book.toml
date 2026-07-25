@@ -12,7 +12,7 @@ create-missing = false
 
 [output.html]
 default-theme = "navy"
-site-url = "/claude-code-haha/"
+site-url = "/claude-code-haha/mdbook/"
 git-repository-url = "https://github.com/NanmiCoder/cc-haha"
 edit-url-template = "https://github.com/NanmiCoder/cc-haha/edit/main/mdbook/{path}"
 additional-css = ["theme/custom.css"]
