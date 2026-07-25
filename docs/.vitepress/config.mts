@@ -95,6 +95,21 @@ const zhSidebar = [
     ],
   },
   {
+    text: '深度源码分析',
+    collapsed: false,
+    items: [
+      { text: '索引', link: '/in-depth/' },
+      { text: 'Agent 主循环', link: '/in-depth/09-agent-loop-deep-dive' },
+      { text: '权限系统', link: '/in-depth/10-permission-system-deep-dive' },
+      { text: 'Provider/模型', link: '/in-depth/11-provider-model-system' },
+      { text: 'MCP/Skills', link: '/in-depth/12-mcp-skills-system' },
+      { text: 'Server/Desktop', link: '/in-depth/13-server-desktop-architecture' },
+      { text: 'CLI/TUI', link: '/in-depth/14-cli-tui-startup' },
+      { text: '工具系统', link: '/in-depth/15-tools-system-deep-dive' },
+      { text: '多Agent/Hooks', link: '/in-depth/16-multi-agent-hooks' },
+    ],
+  },
+  {
     text: '参考',
     collapsed: true,
     items: [
@@ -177,6 +192,21 @@ const enSidebar = [
     items: [
       { text: 'Source Fixes', link: '/en/reference/fixes' },
       { text: 'Project Structure', link: '/en/reference/project-structure' },
+    ],
+  },
+  {
+    text: 'In-Depth Analysis',
+    collapsed: true,
+    items: [
+      { text: 'Index', link: '/in-depth/' },
+      { text: 'Agent Loop', link: '/in-depth/09-agent-loop-deep-dive' },
+      { text: 'Permission System', link: '/in-depth/10-permission-system-deep-dive' },
+      { text: 'Provider/Model', link: '/in-depth/11-provider-model-system' },
+      { text: 'MCP/Skills', link: '/in-depth/12-mcp-skills-system' },
+      { text: 'Server/Desktop', link: '/in-depth/13-server-desktop-architecture' },
+      { text: 'CLI/TUI', link: '/in-depth/14-cli-tui-startup' },
+      { text: 'Tools System', link: '/in-depth/15-tools-system-deep-dive' },
+      { text: 'Multi-Agent/Hooks', link: '/in-depth/16-multi-agent-hooks' },
     ],
   },
 ]

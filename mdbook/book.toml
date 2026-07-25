@@ -1,0 +1,24 @@
+[book]
+title = "Claude Code Haha 源码深度分析"
+authors = ["Claude Code Haha Contributors"]
+language = "zh-CN"
+description = "基于 Claude Code 泄露源码的 Agent 运行原理与自建开发指南"
+
+src = "src"
+
+[build]
+build-dir = "book"
+create-missing = false
+
+[output.html]
+default-theme = "navy"
+site-url = "/claude-code-haha/"
+git-repository-url = "https://github.com/NanmiCoder/cc-haha"
+edit-url-template = "https://github.com/NanmiCoder/cc-haha/edit/main/mdbook/{path}"
+additional-css = ["theme/custom.css"]
+additional-js = ["theme/mermaid-init.js"]
+
+[output.html.search]
+enable = true
+limit-results = 30
+use-boolean-and = true
