@@ -1,11 +1,10 @@
-name: Deploy VitePress + mdBook Docs
+name: Deploy VitePress Docs
 
 on:
   push:
     branches: [main]
     paths:
       - 'docs/**'
-      - 'mdbook/**'
       - 'package.json'
       - '.github/workflows/deploy-docs.yml'
   workflow_dispatch:
@@ -37,23 +36,6 @@ jobs:
 
       - name: Build VitePress
         run: npm run docs:build
-
-      # peaceiris/actions-mdbook@v2 still runs on the deprecated node20 runtime
-      # (node24 only exists on its unreleased main), so install the official
-      # binary directly instead.
-      - name: Setup mdBook
-        run: |
-          MDBOOK_VERSION=0.4.44
-          curl -fsSL \
-            "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
-            | tar -xz -C /usr/local/bin
-          mdbook --version
-
-      - name: Build mdBook
-        run: mdbook build mdbook
-
-      - name: Copy mdBook into VitePress dist
-        run: cp -r mdbook/book docs/.vitepress/dist/mdbook
 
       - name: Deploy to gh-pages
         uses: peaceiris/actions-gh-pages@v4.1.0
