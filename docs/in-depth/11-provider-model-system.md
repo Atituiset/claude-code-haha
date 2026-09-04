@@ -19,69 +19,64 @@ flowchart TD
 ### 1.1 客户端初始化
 
 ```typescript
-// src/services/api/client.ts
-function getAnthropicClient(): Anthropic {
-  // 按优先级检查环境变量和配置
-  const provider = detectProvider()
-
-  switch (provider) {
-    case 'bedrock':
-      return new AnthropicBedrock({
-        awsAccessKey: process.env.AWS_ACCESS_KEY_ID,
-        awsSecretKey: process.env.AWS_SECRET_ACCESS_KEY,
-        awsRegion: process.env.AWS_REGION ?? 'us-east-1',
-      })
-
-    case 'vertex':
-      return new AnthropicVertex({
-        projectId: process.env.CLOUD_ML_PROJECT_ID,
-        region: process.env.CLOUD_ML_REGION ?? 'us-east5',
-      })
-
-    case 'oauth':
-      // 使用 OAuth token 认证
-      return new Anthropic({
-        apiKey: getOAuthToken(),
-        baseURL: getOAuthBaseUrl(),
-      })
-
-    default:
-      return new Anthropic({
-        apiKey: process.env.ANTHROPIC_API_KEY!,
-        baseURL: process.env.ANTHROPIC_BASE_URL,
-      })
+// src/services/api/client.ts:112（结构示意，真实为 async）
+export async function getAnthropicClient({ apiKey } = {}) {
+  // 按 if 分支顺序检查（client.ts:187-340）：
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_BEDROCK)) {
+    const { AnthropicBedrock } = await import('@anthropic-ai/bedrock-sdk')
+    // AWS 凭证走 aws-sdk 默认链；region 支持 AWS_REGION/AWS_DEFAULT_REGION
+    return new AnthropicBedrock(bedrockArgs)
   }
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_FOUNDRY)) {
+    // Foundry（Azure）：ANTHROPIC_FOUNDRY_RESOURCE 或 ANTHROPIC_FOUNDRY_BASE_URL
+    // 认证：ANTHROPIC_FOUNDRY_API_KEY 或 Azure AD DefaultAzureCredential
+  }
+  if (isEnvTruthy(process.env.CLAUDE_CODE_USE_VERTEX)) {
+    const [{ AnthropicVertex }, { GoogleAuth }] = await Promise.all([...])
+    // 项目：ANTHROPIC_VERTEX_PROJECT_ID；区域支持模型级 VERTEX_REGION_* 变量
+    return new AnthropicVertex(vertexArgs)
+  }
+  // OpenAI Responses 模型 → OpenAI 兼容路径
+  // OAuth（Claude.ai 订阅）→ baseURL 取自 OAuth config
+  // 默认：new Anthropic({ apiKey: resolveAnthropicClientApiKey(...) })
 }
 ```
 
-### 1.2 Provider 检测优先级
+### 1.2 Provider 检测优先级（`client.ts:187-340`）
 
 ```
 1. CLAUDE_CODE_USE_BEDROCK=1    → Bedrock
-2. CLAUDE_CODE_USE_VERTEX=1     → Vertex
-3. ANTHROPIC_API_KEY 存在       → Anthropic 直连
-4. OAuth token 存在             → Anthropic OAuth
-5. CCR 上游代理配置             → CCR Proxy
-6. OpenAI 配置                  → OpenAI
+2. CLAUDE_CODE_USE_FOUNDRY=1    → Foundry (Azure)
+3. CLAUDE_CODE_USE_VERTEX=1     → Vertex
+4. OpenAI Responses 模型配置    → OpenAI 兼容路径
+5. ANTHROPIC_AUTH_TOKEN / OAuth → Anthropic OAuth（Claude.ai 订阅）
+6. ANTHROPIC_API_KEY / apiKeyHelper → Anthropic 直连
 ```
 
 ## 2. 模型选择与解析
 
 ### 2.1 模型别名系统
 
-Claude Code 使用模型别名简化模型选择：
+别名是**枚举集合**而非"别名→具体 ID"的静态映射——解析在运行时根据当前默认模型动态进行（`src/utils/model/aliases.ts:1-7`、`model.ts:488-502`）：
 
 ```typescript
-// 别名到具体模型的映射
-const MODEL_ALIASES = {
-  'sonnet':     'claude-sonnet-4-20250514',
-  'sonnet4':    'claude-sonnet-4-20250514',
-  'opus':       'claude-opus-4-20250514',
-  'opus4':      'claude-opus-4-20250514',
-  'haiku':      'claude-haiku-3-5-20241022',
-  'sonnet[1m]': 'claude-sonnet-4-20250514',  // 1M 上下文
-  'opus[1m]':   'claude-opus-4-20250514',    // 1M 上下文
-}
+export const MODEL_ALIASES = [
+  'sonnet',
+  'opus',
+  'haiku',
+  'best',
+  'sonnet[1m]',
+  'opus[1m]',
+  'opusplan',
+] as const
+
+// 解析规则（model.ts:488）：
+// 'opusplan'  → Sonnet 默认（plan 模式时切 Opus）
+// 'sonnet'    → getDefaultSonnetModel()   // 当前为 sonnet-4-6
+// 'haiku'     → getDefaultHaikuModel()
+// 'opus'      → getDefaultOpusModel()     // 当前为 claude-opus-4-7
+// 'best'      → getBestModel()
+// '[1m]' 后缀 → 解析后追加 1M 上下文标记
 ```
 
 ### 2.2 模型选择链
@@ -92,18 +87,19 @@ const MODEL_ALIASES = {
   > 环境变量 ANTHROPIC_MODEL
   > 用户设置中的默认模型
   > 项目设置中的默认模型
-  > 产品默认模型 (claude-sonnet-4-20250514)
+  > 产品默认模型 (Sonnet 4.6)
 ```
 
 ### 2.3 模型迁移
 
 ```typescript
-// src/migrations/ 目录下的模型迁移
+// src/migrations/ 目录下的迁移（12 个文件），模型相关包括：
 migrateFennecToOpus.ts       // Fennec → Opus 重命名
 migrateLegacyOpusToCurrent.ts  // 旧 Opus → 当前 Opus
 migrateOpusToOpus1m.ts       // Opus → Opus 1M
 migrateSonnet1mToSonnet45.ts // Sonnet[1m] → pin 到 4.5 版本
 migrateSonnet45ToSonnet46.ts // Sonnet 4.5 → 4.6
+// 其余为设置迁移：autoUpdates、bypassPermissions、mcpServers 等
 
 // 每个迁移：
 // 1. 检查全局 config 中的完成标记
@@ -152,12 +148,15 @@ function resolveThinkingConfig(
 
 ### 3.3 用户控制
 
-在 REPL 中，用户可以通过快捷键切换思考模式：
+在 REPL 中，`Meta+T`（绑定 `chat:thinkingToggle`，`defaultBindings.ts:72`）打开思考模式选择器。注意：当前选择器是**开/关**二选（`src/components/ThinkingToggle.tsx`：Enabled/Disabled），没有 low/medium/high 三档循环：
 
 ```
-Meta+T (macOS: Cmd+T) → 切换思考模式
-  off → low (1024 tokens) → medium (8192) → high (32768) → off
+Meta+T → ThinkingToggle 选择器
+  Enabled  (Claude will think before responding)
+  Disabled (Claude will respond without extended thinking)
 ```
+
+CLI 侧还提供 `--thinking <enabled|adaptive|disabled>` 与（已废弃的）`--max-thinking-tokens`（`src/main.tsx`）。
 
 ## 4. 缓存控制
 
@@ -448,4 +447,4 @@ function getClient(provider: string): LLMClient {
 | `src/utils/modelCost.ts` | - | 模型成本计算 |
 | `src/constants/apiLimits.ts` | - | API 限制常量 |
 | `src/constants/system.ts` | - | 系统提示前缀和归因头 |
-| `src/migrations/` | 11 files | 模型迁移 |
+| `src/migrations/` | 12 files | 模型/设置迁移 |

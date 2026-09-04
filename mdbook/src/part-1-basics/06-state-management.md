@@ -7,12 +7,12 @@ Claude Code 使用多种状态管理机制：
 - **App 状态**：UI 和交互状态（消息、工具调用结果等）
 - **持久化状态**：通过文件系统存储的配置和会话数据
 
-## 2. Bootstrap 状态 (`src/bootstrap/state.js`)
+## 2. Bootstrap 状态 (`src/bootstrap/state.ts`)
 
 ### 2.1 核心状态变量
 
 ```typescript
-// src/bootstrap/state.js
+// src/bootstrap/state.ts
 interface BootstrapState {
   // 会话管理
   sessionId: SessionId
@@ -61,277 +61,152 @@ export function setOriginalCwd(cwd: string): void
 
 ### 2.3 会话切换
 
+真实实现（`src/bootstrap/state.ts:468`）非常轻量——只换 ID 与目录并发出信号，没有"保存/加载会话状态"步骤：
+
 ```typescript
-export function switchSession(id: SessionId): void {
-  const previousId = currentState.sessionId
-  
-  // 1. 保存当前会话状态
-  saveSessionState(previousId)
-  
-  // 2. 切换会话 ID
-  currentState.sessionId = id
-  
-  // 3. 加载新会话状态
-  loadSessionState(id)
-  
-  // 4. 通知状态变化
-  broadcastSessionChange({
-    previousId,
-    newId: id,
-  })
+export function switchSession(
+  sessionId: SessionId,
+  projectDir: string | null = null,
+): void {
+  // 清理旧会话的 plan-slug 缓存，保持 Map 有界
+  STATE.planSlugCache.delete(STATE.sessionId)
+  STATE.sessionId = sessionId
+  STATE.sessionProjectDir = projectDir
+  sessionSwitched.emit(sessionId)   // 订阅者（如 concurrentSessions）自行同步
 }
+
+// 订阅接口
+export const onSessionSwitch = sessionSwitched.subscribe
 ```
 
-## 3. App 状态 (`src/state/AppStateStore.js`)
+## 3. App 状态 (`src/state/AppStateStore.ts`)
 
 ### 3.1 AppState 接口
 
+真实 AppState 是 `DeepImmutable` 类型的扁平结构（`src/state/AppStateStore.ts:89`），核心字段：
+
 ```typescript
-export interface AppState {
-  // 消息历史
-  messages: Message[]
-  
-  // 推测性执行
-  speculation: Speculation | null
-  
-  // 可用工具
-  tools: Tool[]
-  
-  // MCP 相关
-  mcpClients: Map<string, McpClient>
-  mcpTools: Tool[]
-  
-  // 权限请求
-  permissionRequests: PermissionRequest[]
-  
-  // 通知
-  notifications: Notification[]
-  
-  // 会话成本
-  sessionCost: number
-  costThreshold: number
-  
-  // UI 状态
-  inputValue: string
-  selectedAgentId: string | null
-  vimMode: 'normal' | 'insert'
-  
-  // 主题
-  theme: ThemeName
-  themeSettings: ThemeSettings
-  
-  // 性能指标
-  fps: number
-  fpsAverage: number
-  fpsLow1Pct: number
-}
+export type AppState = DeepImmutable<{
+  messages: Message[]                    // 消息历史
+  speculation: SpeculationState          // 提示建议的推测执行状态
+  tools: Tool[]                          // 可用工具
+  mcp: { ... }                           // MCP 服务器/命令/资源视图
+  toolPermissionContext: ToolPermissionContext
+  tasks: ...                              // 后台任务/队友任务表
+  notifications: { ... }
+  mainLoopModel: ModelSetting            // 当前模型
+  // vimMode/主题等 UI 偏好存于全局配置，不在 AppState
+  // fps 指标由 src/utils/fpsTracker.ts 独立采集（FpsMetricsProvider）
+}>
+
+export function getDefaultAppState(): AppState { /* ... */ }
 ```
 
-### 3.2 状态存储 (`Zustand`)
+### 3.2 状态存储（自研轻量 store）
+
+注意：CLI 的状态层**不是 Zustand**（Zustand 只在 Desktop 用）。`src/state/store.ts` 提供自研 `createStore`；写入 API 是 `setAppState(fn)`，组件侧通过 `useAppState`（`src/state/AppState.tsx`）以 selector 订阅。
 
 ```typescript
-// src/state/store.js
-import { createStore } from './store.js'
-
-export const appStore = createStore<AppState>((set, get) => ({
-  // 初始状态
-  messages: [],
-  speculation: null,
-  tools: [],
-  mcpClients: new Map(),
-  mcpTools: [],
-  permissionRequests: [],
-  notifications: [],
-  sessionCost: 0,
-  costThreshold: 100,
-  inputValue: '',
-  selectedAgentId: null,
-  vimMode: 'insert',
-  theme: 'dark',
-  themeSettings: defaultThemeSettings,
-  fps: 0,
-  fpsAverage: 0,
-  fpsLow1Pct: 0,
-  
-  // 操作
-  addMessage: (message: Message) => set(state => ({
-    messages: [...state.messages, message],
-  })),
-  
-  setSpeculation: (speculation: Speculation | null) => set({
-    speculation,
-  }),
-  
-  addPermissionRequest: (request: PermissionRequest) => set(state => ({
-    permissionRequests: [...state.permissionRequests, request],
-  })),
-  
-  // ...
-}))
+// src/state/store.ts
+export function createStore<T>(/* ... */) {
+  // getState / setState / subscribe
+}
 ```
 
 ### 3.3 React Hooks
 
 ```typescript
-// src/state/AppState.js
-export function useAppState<T>(selector: (state: AppState) => T): T {
-  const store = useStore(appStore)
-  return useSyncExternalStore(
-    store.subscribe,
-    () => selector(store.getState()),
-    () => selector(store.getState()),
-  )
-}
+// src/state/AppState.tsx 提供 useAppState(selector)
+// 基于 React useSyncExternalStore 订阅 store 变化
+const messages = useAppState(s => s.messages)
 
-export function useSetAppState(): {
-  addMessage: (message: Message) => void
-  setSpeculation: (speculation: Speculation | null) => void
-  // ...
-} {
-  return {
-    addMessage: (message) => appStore.getState().addMessage(message),
-    setSpeculation: (speculation) => appStore.getState().setSpeculation(speculation),
-    // ...
-  }
-}
+// 写入通过 setAppState（任意路径），不是逐字段的 setter 对象
+setAppState(prev => ({ ...prev, messages: [...prev.messages, msg] }))
 ```
 
-### 3.4 状态变化监听 (`src/state/onChangeAppState.js`)
+### 3.4 状态变化副作用 (`src/state/onChangeAppState.ts`)
+
+`onChangeAppState({ newState, oldState })` 消费每次 diff（真实签名 `src/state/onChangeAppState.ts:43`）：
 
 ```typescript
-export function onChangeAppState(
-  partial: Partial<AppState> | ((prev: AppState) => Partial<AppState>),
-  shouldRender = true,
-): void {
-  // 1. 更新状态
-  appStore.setState(partial)
-  
-  // 2. 触发渲染更新
-  if (shouldRender) {
-    requestAnimationFrame(() => {
-      // 触发 Ink 重新渲染
-      inkRoot.render(<App />)
-    })
-  }
-  
-  // 3. 持久化（如需要）
-  if (shouldPersist(partial)) {
-    saveAppStateSnapshot(appStore.getState())
-  }
+export function onChangeAppState({
+  newState,
+  oldState,
+}: {
+  newState: AppState
+  oldState: AppState
+}) {
+  // 权限模式变化 → 通知 CCR external_metadata 与 SDK 状态流
+  //   （统一 choke point，替代散落各处的手动 notify）
+  // mainLoopModel 变化 → 写回用户设置 / bootstrap override
+  // expandedView 变化 → 持久化 showExpandedTodos / showSpinnerTree
+  // ...
 }
 ```
+
+它不负责"触发 Ink 重渲染"——渲染由 React 订阅机制自动驱动，也没有 `shouldPersist(partial)` 快照逻辑。
 
 ## 4. 持久化状态
 
-### 4.1 会话存储 (`src/utils/sessionStorage.js`)
+### 4.1 会话存储 (`src/utils/sessionStorage.ts`)
+
+会话以 **JSONL 转录文件**持久化（`sessionStorage.ts:204`）：`~/.claude/projects/<项目目录编码>/<sessionId>.jsonl`；子 Agent 有独立转录（`agent-<agentId>.jsonl`）。关键函数包括 `getTranscriptPathForSession`、`searchSessionsByCustomTitle`（按自定义标题搜索历史会话，供 /resume 使用）等。
 
 ```typescript
-interface SessionData {
-  sessionId: string
-  messages: Message[]
-  model: string
-  cost: number
-  startedAt: number
-  lastActivityAt: number
-  title?: string
-  customTitle?: string
-}
-
-// 保存会话
-export function saveSession(session: SessionData): void {
-  const sessionsDir = path.join(getSessionDir())
-  ensureDirExists(sessionsDir)
-  
-  const filePath = path.join(sessionsDir, `${session.sessionId}.json`)
-  writeFileSync(filePath, JSON.stringify(session))
-}
-
-// 加载会话
-export function loadSession(sessionId: string): SessionData | null {
-  const filePath = path.join(getSessionDir(), `${sessionId}.json`)
-  
-  if (!existsSync(filePath)) {
-    return null
-  }
-  
-  return JSON.parse(readFileSync(filePath, 'utf8'))
-}
-
-// 搜索会话
-export function searchSessionsByCustomTitle(title: string): SessionData[] {
-  const sessionsDir = getSessionDir()
-  const files = readdirSync(sessionsDir).filter(f => f.endsWith('.json'))
-  
-  return files
-    .map(f => JSON.parse(readFileSync(path.join(sessionsDir, f), 'utf8')))
-    .filter(s => s.customTitle?.includes(title))
-}
+// src/utils/sessionStorage.ts:204
+return join(projectDir, `${getSessionId()}.jsonl`)
+// 子 Agent 转录
+return join(base, `agent-${agentId}.jsonl`)
 ```
 
-### 4.2 配置存储 (`src/utils/config.js`)
+### 4.2 全局配置 (`src/utils/config.ts`)
+
+`~/.claude.json` 是全局配置文件（注意不是 `~/.claude/settings.json`）。真实 `GlobalConfig`（`config.ts:183`）字段很多，代表性的包括：
 
 ```typescript
-interface GlobalConfig {
-  version: string
-  lastReleaseNotesSeen: string
-  permissions: PermissionConfig
-  themes: ThemeSettings
-  agentSwarmsEnabled: boolean
+export type GlobalConfig = {
+  projects?: Record<string, ProjectConfig>   // 按项目路径索引
+  numStartups: number
+  installMethod?: InstallMethod
+  autoUpdates?: boolean
+  userID?: string
+  theme: ThemeSetting
+  hasCompletedOnboarding?: boolean
+  lastReleaseNotesSeen?: string
+  mcpServers?: Record<string, McpServerConfig>   // 用户级 MCP
+  preferredNotifChannel: NotificationChannel
+  // ... 更多
 }
 
-export function getGlobalConfig(): GlobalConfig {
-  const configPath = path.join(getGlobalConfigDir(), 'settings.json')
-  
-  if (!existsSync(configPath)) {
-    return defaultConfig
-  }
-  
-  return JSON.parse(readFileSync(configPath, 'utf8'))
-}
-
-export function saveGlobalConfig(config: Partial<GlobalConfig>): void {
-  const current = getGlobalConfig()
-  const updated = { ...current, ...config }
-  
-  writeFileSync(
-    getGlobalConfigPath(),
-    JSON.stringify(updated, null, 2),
-  )
-}
+// 读取/写入带合并语义（saveGlobalConfig 接收函数式更新）
+export function getGlobalConfig(): GlobalConfig
+export function saveGlobalConfig(
+  update: GlobalConfig | ((current: GlobalConfig) => GlobalConfig),
+): void
 ```
 
 ### 4.3 项目配置
 
+项目配置**不在** `.claude/settings.json`，而是全局配置中按项目路径索引的 `projects` 键（`config.ts:76`）。真实字段：
+
 ```typescript
-interface ProjectConfig {
-  projectRoot: string
-  lastSessionId: string | null
+export type ProjectConfig = {
+  allowedTools: string[]
+  mcpContextUris: string[]
   lastCost?: number
   lastDuration?: number
   lastLinesAdded?: number
   lastLinesRemoved?: number
-}
-
-export function getCurrentProjectConfig(): ProjectConfig {
-  const configPath = path.join(getProjectRoot(), '.claude', 'settings.json')
-  
-  if (!existsSync(configPath)) {
-    return defaultProjectConfig
-  }
-  
-  return JSON.parse(readFileSync(configPath, 'utf8'))
-}
-
-export function saveProjectConfig(config: Partial<ProjectConfig>): void {
-  const current = getCurrentProjectConfig()
-  const updated = { ...current, ...config }
-  
-  writeFileSync(
-    path.join(getProjectRoot(), '.claude', 'settings.json'),
-    JSON.stringify(updated, null, 2),
-  )
+  lastSessionId?: string          // /resume 默认目标
+  lastFpsAverage?: number
+  lastFpsLow1Pct?: number
+  hasTrustDialogAccepted?: boolean
+  projectOnboardingSeenCount: number
+  // ... 更多
 }
 ```
+
+另有独立的 `~/.claude/settings.json` / 项目 `.claude/settings.json`（settings 层，含 permissions/hooks/model 等，见 `src/utils/settings/`），与 GlobalConfig 分层管理。
 
 ## 5. 数据流
 
@@ -482,169 +357,62 @@ Tool Execution Request
    └─────────┘  └─────────┘
 ```
 
+
 ## 6. 状态初始化
 
-### 6.1 应用启动
+### 6.1 应用启动（真实次序）
 
-```typescript
-async function initializeApp(): Promise<void> {
-  // 1. 初始化 Bootstrap 状态
-  setCwd(initialCwd)
-  setProjectRoot(initialCwd)
-  setSessionId(generateSessionId())
-  
-  // 2. 加载持久化配置
-  enableConfigs()
-  loadGlobalConfig()
-  loadProjectConfig()
-  
-  // 3. 初始化 App 状态
-  const defaultState = getDefaultAppState()
-  appStore.setState(defaultState)
-  
-  // 4. 加载历史会话（如需恢复）
-  if (options.resumeSession) {
-    await loadConversationForResume(options.sessionId)
-  }
-  
-  // 5. 初始化 MCP 服务器
-  await startMcpServers()
-  
-  // 6. 初始化工具列表
-  const tools = await getTools()
-  appStore.setState({ tools })
-}
 ```
+bin/claude-haha
+  → entrypoints/cli.tsx（快速路径路由）
+  → main.tsx action handler
+      → init()           // 13 步初始化（enableConfigs 等，见第 14 章）
+      → setup(cwd, ...)   // 工作目录/UDS/hooks 快照
+      → showSetupScreens // 信任对话框/入职/MCP 审批
+      → launchRepl       // 渲染 App + REPL
+```
+
+REPL 挂载后，`useMergedTools` 等 hook 拉取工具池（内置 + MCP），写入 AppState。
 
 ### 6.2 会话恢复
 
-```typescript
-async function loadConversationForResume(
-  sessionId: string,
-): Promise<void> {
-  // 1. 加载会话数据
-  const sessionData = loadSession(sessionId)
-  
-  if (!sessionData) {
-    throw new Error(`Session not found: ${sessionId}`)
-  }
-  
-  // 2. 恢复状态
-  switchSession(sessionId)
-  
-  // 3. 恢复消息历史
-  appStore.setState({
-    messages: sessionData.messages,
-    sessionCost: sessionData.cost,
-  })
-  
-  // 4. 恢复模型配置
-  setMainLoopModelOverride(sessionData.model)
-}
-```
+`--resume` / `/resume` 流程（`src/commands/resume/resume.tsx`）：从 `~/.claude/projects/.../<sessionId>.jsonl` 加载转录（`loadFullLog` 等），`switchSession(sessionId, projectDir)` 切换 bootstrap 状态，消息历史回填 AppState。成本与 token 计数由 `src/cost-tracker.ts` 在使用侧累加。
 
 ## 7. 性能指标追踪
 
-### 7.1 FPS 追踪 (`src/utils/fpsTracker.js`)
+### 7.1 FPS 追踪 (`src/utils/fpsTracker.ts`)
+
+注意路径是 `.ts`。提供 `FpsMetrics`（current/average/low1Pct），由 `FpsMetricsProvider`（`src/components/App.tsx`）注入组件树，会话结束时写入 ProjectConfig 的 `lastFpsAverage/lastFpsLow1Pct`。
+
+### 7.2 成本追踪 (`src/cost-tracker.ts`, 381 行)
+
+成本数据存于 **bootstrap state 计数器**（totalCostUSD、totalInputTokens 等），不是 AppState 字段：
 
 ```typescript
-interface FpsMetrics {
-  current: number
-  average: number
-  low1Pct: number
-  samples: number[]
-}
-
-export class FpsTracker {
-  private samples: number[] = []
-  private lastFrame: number = 0
-  
-  tick(): void {
-    const now = performance.now()
-    const delta = now - this.lastFrame
-    this.lastFrame = now
-    
-    const fps = 1000 / delta
-    this.samples.push(fps)
-    
-    // 保持最近 300 帧
-    if (this.samples.length > 300) {
-      this.samples.shift()
-    }
-  }
-  
-  getMetrics(): FpsMetrics {
-    const sorted = [...this.samples].sort((a, b) => a - b)
-    
-    return {
-      current: sorted[sorted.length - 1],
-      average: sorted.reduce((a, b) => a + b) / sorted.length,
-      low1Pct: sorted[Math.floor(sorted.length * 0.01)],
-      samples: this.samples.length,
-    }
-  }
-}
+getTotalCostUSD()        // 总成本 (USD)
+getModelUsage()           // 按模型的使用量
+getTotalInputTokens()
+getTotalOutputTokens()
 ```
 
-### 7.2 成本追踪
-
-```typescript
-interface CostMetrics {
-  inputTokens: number
-  outputTokens: number
-  cacheCreationTokens: number
-  cacheReadTokens: number
-  totalCost: number
-}
-
-export function trackApiCost(usage: Usage): void {
-  const state = appStore.getState()
-  
-  const metrics: CostMetrics = {
-    inputTokens: usage.input_tokens,
-    outputTokens: usage.output_tokens,
-    cacheCreationTokens: usage.cache_creation_input_tokens ?? 0,
-    cacheReadTokens: usage.cache_read_input_tokens ?? 0,
-    totalCost: calculateCost(usage),
-  }
-  
-  // 更新 App 状态
-  appStore.setState(state => ({
-    sessionCost: state.sessionCost + metrics.totalCost,
-  }))
-  
-  // 保存到会话数据
-  saveSessionCost(metrics)
-}
-```
+会话结束时 `saveCurrentSessionCosts()` 写入 ProjectConfig（lastCost/lastModelUsage 等），恢复会话时 `restoreCostStateForSession()` 回读。
 
 ## 8. 状态调试
 
-### 8.1 状态检查命令
+### 8.1 检查命令
 
 ```bash
-# 查看当前会话状态
-claude-haha session info
+# 恢复选择器（列出历史会话）
+claude-haha --resume
+claude-haha -r            # 恢复最近一次会话
 
-# 查看历史会话
-claude-haha session list
-
-# 查看配置
-claude-haha config show
+# 非交互输出（观察单轮 query 的状态流转）
+claude-haha -p "..." --output-format stream-json
 ```
 
-### 8.2 状态导出
+### 8.2 状态观察
 
-```typescript
-export function exportStateDump(): string {
-  return JSON.stringify({
-    bootstrap: getBootstrapState(),
-    app: appStore.getState(),
-    config: {
-      global: getGlobalConfig(),
-      project: getCurrentProjectConfig(),
-    },
-    sessions: listSessions().map(loadSession),
-  }, null, 2)
-}
-```
+没有 `session info` 子命令或 `exportStateDump`。调试时可用：
+
+- `--debug` / `--debug-to-stderr`：观察权限模式切换、工具决策、hook 执行等事件
+- `--output-format stream-json`：结构化输出每轮消息与 usage

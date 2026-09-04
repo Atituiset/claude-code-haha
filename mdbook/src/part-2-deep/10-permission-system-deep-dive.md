@@ -102,11 +102,13 @@ flowchart TD
     S -->|未超限| Q
 ```
 
-**安全工具白名单** (`isAutoModeAllowlistedTool`)：
-- SendMessage, TaskCreate/Get/List/Output/Update/Stop
-- TeamCreate/Delete, TodoWrite
+**安全工具白名单** (`SAFE_YOLO_ALLOWLISTED_TOOLS`，`src/utils/permissions/classifierDecision.ts:56-93`）：
+- 只读文件操作：Read, Grep, Glob, LSP, ToolSearch, ListMcpResources, ReadMcpResource
+- 任务/计划 UI：TodoWrite, TaskCreate/Get/Update/List/Stop/Output, AskUserQuestion, EnterPlanMode, ExitPlanMode
+- Swarm 协调（仅内部邮箱/团队状态）：TeamCreate, TeamDelete, SendMessage
+- 其他：Sleep, Workflow（门控）, TerminalCapture/OverflowTest（ant 门控）
 
-这些工具天生安全，直接跳过分类器。
+注意：**不含** write/edit 工具——写操作走 acceptEdits 快路径（工作目录内 allow，目录外进分类器）。这些工具天生安全，直接跳过分类器。
 
 ## 4. AI 分类器 (Yolo Classifier)
 

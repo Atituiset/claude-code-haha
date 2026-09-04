@@ -7,7 +7,7 @@
 ### 1.1 核心类型
 
 ```typescript
-// src/Tool.ts (~800+ 行)
+// src/Tool.ts (792 行)
 
 // 工具权限上下文
 type ToolPermissionContext = DeepImmutable<{
@@ -218,21 +218,21 @@ AgentTool.call(input)
   → 返回 Agent 输出作为工具结果
 ```
 
-**Agent 可用工具限制：**
+**Agent 可用工具限制**（真实集合，`src/constants/tools.ts:36-72`）：
 
 ```typescript
-// 子 Agent 不能使用的工具
-const ALL_AGENT_DISALLOWED_TOOLS = [
-  'TaskOutput', 'ExitPlanMode', 'EnterPlanMode',
-  'Agent', 'AskUserQuestion', 'TaskStop', 'Workflow',
-]
+// 所有子 Agent 均不可用（ALL_AGENT_DISALLOWED_TOOLS）
+TASK_OUTPUT, EXIT_PLAN_MODE_V2, ENTER_PLAN_MODE,
+AGENT,        // ant 构建例外：允许嵌套 Agent
+ASK_USER_QUESTION, TASK_STOP,
+WORKFLOW      // feature 门控，防递归执行
 
-// 异步 Agent 允许使用的工具
-const ASYNC_AGENT_ALLOWED_TOOLS = [
-  'FileRead', 'WebSearch', 'TodoWrite', 'Grep', 'WebFetch',
-  'Glob', 'Shell', 'FileEdit', 'FileWrite', 'NotebookEdit',
-  'Skill', 'SyntheticOutput', 'ToolSearch', 'EnterWorktree', 'ExitWorktree',
-]
+// 自定义 Agent 额外禁用（CUSTOM_AGENT_DISALLOWED_TOOLS = 上面 + 更多）
+
+// 异步 Agent 允许的工具（ASYNC_AGENT_ALLOWED_TOOLS，白名单模式）
+FILE_READ, WEB_SEARCH, TODO_WRITE, GREP, WEB_FETCH,
+GLOB, SHELL_*(Bash/PowerShell 等), FILE_EDIT, FILE_WRITE, NOTEBOOK_EDIT,
+SKILL, SYNTHETIC_OUTPUT, TOOL_SEARCH, ENTER_WORKTREE, EXIT_WORKTREE
 ```
 
 ### 4.2 BashTool

@@ -1,21 +1,6 @@
-# Claude Code Haha 源码深度分析
+# 程序执行流程
 
-## 目录
-
-1. [项目概述](#1-项目概述)
-2. [执行流程详解](#2-执行流程详解)
-   - [2.1 入口脚本 (bin/claude-haha)](#21-入口脚本-binclaude-haha)
-   - [2.2 CLI 引导器 (src/entrypoints/cli.tsx)](#22-cli-引导器-srcentrypointsclitsx)
-   - [2.3 主程序 (src/main.tsx)](#23-主程序-srcmaintsx)
-   - [2.4 初始化 (src/setup.ts)](#24-初始化-srcsetupts)
-   - [2.5 REPL 启动器 (src/replLauncher.tsx)](#25-repl-启动器-srcrepllaunchertsx)
-3. [TUI 渲染引擎](#3-tui-渲染引擎)
-4. [工具系统](#4-工具系统)
-5. [Agent 系统](#5-agent-系统)
-6. [MCP 服务](#6-mcp-服务)
-7. [状态管理](#7-状态管理)
-
----
+> 本章梳理从 `claude-haha` 命令到 REPL 就绪的完整启动链路，并给出后续各章的地图。
 
 ## 1. 项目概述
 
@@ -26,8 +11,8 @@ Claude Code Haha 是基于 2026 年 3 月从 Anthropic npm registry 泄露的 Cl
 | 类别 | 技术 |
 |------|------|
 | 运行时 | Bun |
-| 语言 | TypeScript |
-| 终端 UI | React + Ink |
+| 语言 | TypeScript（少量 `.js` 遗留） |
+| 终端 UI | React + Ink（定制版） |
 | CLI 解析 | Commander.js |
 | API | Anthropic SDK |
 | 协议 | MCP, LSP |
@@ -40,24 +25,32 @@ preload.ts                   # Bun preload（设置 MACRO 全局变量）
 src/
 ├── entrypoints/
 │   ├── cli.tsx              # CLI 引导器（处理特殊 flags）
-│   └── init.ts              # 初始化逻辑
+│   ├── init.ts              # 13 步完整初始化
+│   └── mcp.ts               # MCP Server 模式入口
 ├── main.tsx                 # 主程序（Commander.js + React/Ink）
 ├── setup.ts                 # 启动初始化
 ├── replLauncher.tsx         # REPL 启动器
 ├── screens/
-│   └── REPL.tsx             # 主交互界面
-├── ink/                     # Ink 终端渲染引擎
+│   └── REPL.tsx             # 主交互界面（~5000 行）
+├── ink/                     # Ink 终端渲染引擎（定制实现）
+├── ink.ts                   # Ink 导出薄封装
 ├── components/              # UI 组件
-├── tools/                   # Agent 工具
-├── commands/                # 斜杠命令
+├── tools/                   # Agent 工具（50+ 个目录）
+├── tools.ts                 # 工具注册中心
+├── commands/                # 斜杠命令实现
+├── commands.ts              # 命令注册表
 ├── skills/                  # Skill 系统
-├── services/                # 服务层
-│   ├── api/                 # API 客户端
+├── services/
+│   ├── api/                 # API 客户端（claude.ts, client.ts, withRetry.ts）
 │   ├── mcp/                 # MCP 协议
-│   └── analytics/           # 分析/遥测
-├── state/                   # 状态管理
-└── utils/                   # 工具函数
+│   └── tools/               # 工具编排/执行
+├── state/                   # App 状态（AppStateStore.ts）
+├── bootstrap/state.ts       # 全局可变单例状态
+├── query.ts                 # Agent 主循环 async generator
+└── utils/                   # 工具函数（含 permissions/, model/）
 ```
+
+> 注意：本仓库 TypeScript 文件为 `.ts/.tsx`，文档中早期版本写 `.js` 的路径均已修正。
 
 ---
 
@@ -70,20 +63,33 @@ src/
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# 记录调用者工作目录为环境变量
+export CALLER_DIR="${CALLER_DIR:-$(pwd -W 2>/dev/null || pwd)}"
 cd "$ROOT_DIR"
+
+# Desktop/Web 服务器作为父进程启动 CLI 时跳过 .env 加载（避免陈旧的
+# provider key 覆盖已激活的 provider 配置）
+if [[ "${CC_HAHA_SKIP_DOTENV:-0}" == "1" ]]; then
+  ENV_FILE_FLAG="--env-file=/dev/null"
+elif [[ -f .env ]]; then
+  ENV_FILE_FLAG="--env-file=.env"
+else
+  ENV_FILE_FLAG=""
+fi
 
 # 降级模式：简单 readline REPL，无 Ink TUI
 if [[ "${CLAUDE_CODE_FORCE_RECOVERY_CLI:-0}" == "1" ]]; then
-  exec bun --env-file=.env ./src/localRecoveryCli.ts "$@"
+  exec bun $ENV_FILE_FLAG ./src/localRecoveryCli.ts "$@"
 fi
 
 # 默认：完整 CLI + Ink TUI
-exec bun --env-file=.env ./src/entrypoints/cli.tsx "$@"
+exec bun $ENV_FILE_FLAG ./src/entrypoints/cli.tsx "$@"
 ```
 
 **关键逻辑：**
-1. 切换到项目根目录
-2. 检查 `CLAUDE_CODE_FORCE_RECOVERY_CLI` 环境变量
+1. 记录 `CALLER_DIR`（调用者目录）并切换到项目根目录
+2. 按 `CC_HAHA_SKIP_DOTENV` / `.env` 存在性决定环境加载方式
+3. 检查 `CLAUDE_CODE_FORCE_RECOVERY_CLI`
    - 为 `1` 时：启动降级 Recovery CLI（`localRecoveryCli.ts`）
    - 默认：启动完整 CLI（`cli.tsx`）
 
@@ -162,42 +168,22 @@ const repl = await launchRepl(options)
 
 ### 2.4 初始化 (src/setup.ts)
 
-`setup()` 函数执行大量初始化工作：
+`setup()` 函数执行大量初始化工作（真实签名见 `src/setup.ts`，含 cwd、permissionMode、worktree、tmux、customSessionId 等参数）：
 
-```typescript
-export async function setup(
-  cwd: string,
-  permissionMode: PermissionMode,
-  allowDangerouslySkipPermissions: boolean,
-  worktreeEnabled: boolean,
-  worktreeName: string | undefined,
-  tmuxEnabled: boolean,
-  customSessionId?: string | null,
-  worktreePRNumber?: number,
-  messagingSocketPath?: string,
-): Promise<void>
-```
+**主要步骤（源码注释编号）：**
 
-**主要步骤：**
-
-1. **Node.js 版本检查**（需 >= 18）
-2. **启动 UDS 消息服务器**（`feature('UDS_INBOX')`）
-3. **终端备份恢复**（iTerm2、Terminal.app）
-4. **设置工作目录**（`setCwd()`, `setProjectRoot()`）
-5. **捕获 Hooks 配置快照**
+1. **Node.js 版本检查**（需 >= 18；Bun 运行时同样满足该检查）
+2. **启动 UDS 消息服务器**（Swarm/teammate 通信，非固定 feature 门控）
+3. **捕获 Hooks 配置快照**
+4. **启动文件变更监听器**（hook 触发器）
+5. **定位 git root，设置项目根目录**（`setCwd()`, `setProjectRoot()`）
 6. **处理 Worktree 创建**（如需）
-7. **初始化后台任务**
-   - `initSessionMemory()`
-   - `lockCurrentVersion()`
-   - 插件预取
-   - Hook 加载
-8. **预取数据**
-   - API Key 预取
-   - 发布说明检查
-   - 最近的活跃会话
-9. **安全检查**
-   - 权限模式验证
-   - Docker/沙箱检测
+7. **后台家务任务**（并行、非阻塞）
+8. **初始化会话记忆**（`initSessionMemory()`）
+9. **终端备份恢复**（Apple Terminal、iTerm2）
+10. **锁定当前版本**（原生安装器场景）
+
+> 注意：早期版本文档把"API Key 预取、发布说明检查、Docker 检测"列为 setup 步骤，实际这些发生在 `main.tsx` 的 action handler 与 `entrypoints/init.ts` 的 13 步初始化中（见第 14 章）。
 
 ### 2.5 REPL 启动器 (src/replLauncher.tsx)
 
@@ -274,81 +260,72 @@ function MyComponent() {
 
 ---
 
+
 ## 4. 工具系统
 
 工具系统允许 Agent 执行各种操作（bash 命令、文件编辑、搜索等）。
 
 ### 工具注册 (`src/tools.ts`)
 
-```typescript
-export function getTools(permissionContext: PermissionContext): Tool[] {
-  return [
-    ...getAllBaseTools(),
-    ...getMcpTools(),
-    ...getSwarmTools(),
-  ]
-}
+`getTools(permissionContext)` 只返回内置工具（真实签名见 `src/tools.ts:272`）：
 
-function getAllBaseTools(): Tool[] {
-  return [
-    AgentTool,
-    BashTool,
-    GrepTool,
-    GlobTool,
-    FileReadTool,
-    FileEditTool,
-    FileWriteTool,
-    WebFetchTool,
-    WebSearchTool,
-    TaskCreateTool,
-    TaskListTool,
-    TaskGetTool,
-    TaskUpdateTool,
-    SkillTool,
-    MCPTool,
-    // ...
-  ]
+```typescript
+export const getTools = (permissionContext: ToolPermissionContext): Tools => {
+  // Simple 模式：仅 Bash / Read / Edit（CLAUDE_CODE_SIMPLE=1）
+  if (isEnvTruthy(process.env.CLAUDE_CODE_SIMPLE)) { /* ... */ }
+
+  const specialTools = new Set([
+    ListMcpResourcesTool.name,
+    ReadMcpResourceTool.name,
+    SYNTHETIC_OUTPUT_TOOL_NAME,
+  ])
+
+  const tools = getAllBaseTools().filter(tool => !specialTools.has(tool.name))
+  // 过滤 deny 规则命中的工具，再按 isEnabled() 过滤
+  return allowedTools.filter(...)
 }
 ```
 
-### 核心工具
+MCP 工具不在这里注册，而是由 `assembleToolPool`（`src/tools.ts:338` 附近）把 `getTools()` 结果与 MCP 工具按名字去重合并（内置优先），供 REPL（`useMergedTools`）和子 Agent 运行时共用。
+
+### 核心工具（`src/tools/` 目录）
 
 | 工具 | 功能 | 关键文件 |
 |------|------|----------|
 | `BashTool` | 执行 Shell 命令 | tools/BashTool/ |
-| `FileReadTool` | 读取文件 | tools/FileReadTool/ |
-| `FileEditTool` | 编辑文件 | tools/FileEditTool/ |
-| `FileWriteTool` | 写入文件 | tools/FileWriteTool/ |
+| `FileReadTool`（工具名 `Read`） | 读取文件 | tools/FileReadTool/ |
+| `FileEditTool`（工具名 `Edit`） | 编辑文件 | tools/FileEditTool/ |
+| `FileWriteTool`（工具名 `Write`） | 写入文件 | tools/FileWriteTool/ |
 | `GlobTool` | 文件模式匹配 | tools/GlobTool/ |
 | `GrepTool` | 内容搜索 | tools/GrepTool/ |
 | `WebFetchTool` | 获取网页 | tools/WebFetchTool/ |
 | `WebSearchTool` | 网络搜索 | tools/WebSearchTool/ |
-| `TaskTool` | 任务管理 | tools/TaskTool/ |
-| `AgentTool` | Agent 协调 | tools/AgentTool/ |
-| `SkillTool` | Skill 调用 | tools/SkillTool/ |
+| Task 系列（`TaskCreate/Get/List/Output/Stop/Update`） | 后台任务管理 | tools/Task*Tool/ |
+| `AgentTool` | 子 Agent | tools/AgentTool/ |
+| `SkillTool`（工具名 `Skill`） | Skill 调用 | tools/SkillTool/ |
 | `MCPTool` | MCP 协议工具 | tools/MCPTool/ |
+| `TodoWriteTool` | 待办管理 | tools/TodoWriteTool/ |
 
-### 工具执行 (`src/services/tools/toolOrchestration.js`)
+### 工具编排 (`src/services/tools/toolOrchestration.ts`)
+
+真实实现不是简单的 find+execute 循环，而是按"连续并发安全批"分区的 async generator（详见第 15 章）：
 
 ```typescript
-export async function runTools(
-  tools: Tool[],
-  inputs: ToolInput[],
-  context: ExecutionContext,
-): Promise<ToolResult[]> {
-  const results: ToolResult[] = []
-
-  for (const input of inputs) {
-    const tool = tools.find(t => t.name === input.name)
-    if (!tool) {
-      throw new Error(`Tool not found: ${input.name}`)
+export async function* runTools(
+  toolUseMessages: ToolUseBlock[],
+  assistantMessages: AssistantMessage[],
+  canUseTool: CanUseToolFn,
+  toolUseContext: ToolUseContext,
+): AsyncGenerator<MessageUpdate, void, void> {
+  for (const { isConcurrencySafe, blocks } of partitionToolCalls(...)) {
+    if (isConcurrencySafe) {
+      // 只读批并发执行（上限 CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY，默认 10）
+      yield* runToolsConcurrently(blocks, ...)
+    } else {
+      // 写操作批串行执行
+      yield* runToolsSerially(blocks, ...)
     }
-
-    const result = await tool.execute(input.params, context)
-    results.push(result)
   }
-
-  return results
 }
 ```
 
@@ -370,32 +347,27 @@ User
 
 ### Agent 定义
 
-Agent 定义存储在 `.claude/agents/` 目录：
+Agent 定义存储在 `.claude/agents/`（项目级）与 `~/.claude/agents/`（用户级）目录，格式是 **Markdown + frontmatter**（不是 JSON，见 `src/tools/AgentTool/loadAgentsDir.ts`）：
 
-```json
-{
-  "name": "my-agent",
-  "description": "Agent description",
-  "instructions": "Agent instructions...",
-  "tools": ["BashTool", "Read"],
-  "model": "claude-opus-4-7-20251120"
-}
+```markdown
+---
+name: my-agent
+description: Agent description
+tools: Read, Grep, Glob
+model: opus
+---
+
+Agent instructions...
 ```
 
-### Agent 加载 (`src/tools/AgentTool/loadAgentsDir.js`)
+### Agent 加载 (`src/tools/AgentTool/loadAgentsDir.ts`)
 
-```typescript
-export function getAgentDefinitionsWithOverrides(): AgentDefinition[] {
-  const bundled = getBundledAgents()
-  const custom = loadCustomAgents()
-  return [...bundled, ...custom]
-}
-```
+`getAgentDefinitionsWithOverrides()`（memoized）合并：内置 Agent（`builtInAgents.ts`，6 个类型）+ 用户/项目/插件/托管来源的自定义 Agent，同名按来源优先级覆盖。
 
 ### Agent 通信
 
 - **UDS 消息传递**：Unix Domain Socket 用于同机器上的 Agent 间通信
-- **SendMessageTool**：Agent 间发送消息
+- **SendMessageTool**：Agent 间邮箱消息
 - **ListPeersTool**：列出已连接的 Agent
 
 ---
@@ -404,27 +376,17 @@ export function getAgentDefinitionsWithOverrides(): AgentDefinition[] {
 
 MCP（Model Context Protocol）允许连接外部数据源和工具。
 
-### MCP 客户端 (`src/services/mcp/client.ts`)
-
-```typescript
-export async function getMcpToolsCommandsAndResources(
-  servers: McpServerConfig[],
-): Promise<McpToolsAndResources> {
-  const clients = await Promise.all(
-    servers.map(config => createMcpClient(config))
-  )
-
-  return {
-    tools: clients.flatMap(c => c.tools),
-    commands: clients.flatMap(c => c.commands),
-    resources: clients.flatMap(c => c.resources),
-  }
-}
-```
-
 ### MCP 配置
 
-MCP 服务器在 `.claude/mcp.json` 中配置：
+MCP 服务器按作用域分层配置（`src/services/mcp/config.ts`、`utils.ts:268`）：
+
+| 作用域 | 文件 |
+|--------|------|
+| project | `.mcp.json`（项目根，可提交到 git 共享） |
+| user | `~/.claude.json`（mcpServers 键） |
+| local | `~/.claude.json`（带 project 标记，私有） |
+| enterprise | `managed-mcp.json`（托管策略） |
+| claude.ai | 云端连接器（自动同步） |
 
 ```json
 {
@@ -450,42 +412,39 @@ MCP 服务器在 `.claude/mcp.json` 中配置：
 
 ## 7. 状态管理
 
-### Bootstrap 状态 (`src/bootstrap/state.js`)
+### Bootstrap 状态 (`src/bootstrap/state.ts`)
+
+全局可变单例（`src/bootstrap/state.ts`，~1781 行、约 260 个字段），每字段配套 `get*/set*` 访问器：
 
 ```typescript
-interface BootstrapState {
+const State = {
   sessionId: SessionId
-  projectRoot: string
   originalCwd: string
-  modelOverride: string | null
-  mainThreadAgentType: AgentType
-  // ...
+  projectRoot: string
+  clientType: 'cli'
+  mainLoopModelOverride: string | undefined
+  mainThreadAgentType: string | undefined
+  // ... 数百个字段
 }
 ```
 
-### App 状态 (`src/state/AppStateStore.js`)
+### App 状态 (`src/state/AppStateStore.ts`)
+
+`AppState` 是 DeepImmutable 类型（`src/state/AppStateStore.ts:89`），关键字段包括：
 
 ```typescript
-export interface AppState {
+export type AppState = DeepImmutable<{
   messages: Message[]
-  speculation: Speculation | null
   tools: Tool[]
-  permissionRequests: PermissionRequest[]
-  notifications: Notification[]
+  speculation: SpeculationState        // 提示建议的推测执行状态
+  notifications: { ... }
+  toolPermissionContext: ToolPermissionContext
+  tasks: ...
   // ...
-}
-
-export function getDefaultAppState(): AppState {
-  return {
-    messages: [],
-    speculation: null,
-    tools: [],
-    permissionRequests: [],
-    notifications: [],
-    // ...
-  }
-}
+}>
 ```
+
+状态写入经由 `setAppState`，变更 diff 由 `onChangeAppState`（`src/state/onChangeAppState.ts:43`）消费——它负责权限模式同步、模型设置持久化等副作用。
 
 ---
 
@@ -505,8 +464,10 @@ export function getDefaultAppState(): AppState {
 | `src/tools.ts` | 工具注册 |
 | `src/tools/*/` | 各工具实现 |
 | `src/services/mcp/client.ts` | MCP 客户端 |
-| `src/bootstrap/state.js` | Bootstrap 状态 |
-| `src/state/AppStateStore.js` | App 状态存储 |
-| `src/commands.js` | 斜杠命令 |
-| `src/query.ts` | 查询执行逻辑 |
+| `src/services/mcp/config.ts` | MCP 配置解析 |
+| `src/bootstrap/state.ts` | Bootstrap 状态单例 |
+| `src/state/AppStateStore.ts` | App 状态类型与默认值 |
+| `src/state/onChangeAppState.ts` | 状态变更副作用 |
+| `src/commands.ts` | 斜杠命令注册表 |
+| `src/query.ts` | Agent 主循环 |
 | `src/Tool.ts` | Tool 类型定义 |

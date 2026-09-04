@@ -24,7 +24,7 @@ MCP (Model Context Protocol) 是一种标准协议，允许 Claude Code 连接�
 
 ### 3.1 配置文件格式
 
-MCP 服务器在 `.claude/mcp.json` 中配置：
+MCP 服务器按作用域分层配置（项目级是项目根的 `.mcp.json`，可提交到 git；用户级在 `~/.claude.json`；企业级为 `managed-mcp.json`，见 `src/services/mcp/utils.ts:260-290`）：
 
 ```json
 {
@@ -176,7 +176,7 @@ export class MCPTool implements Tool {
     private serverName: string,
     private mcpTool: McpServerTool,
   ) {
-    this.name = `mcp_${serverName}_${mcpTool.name}`
+    this.name = `mcp__${serverName}__${mcpTool.name}`  // 双下划线（mcpStringUtils.ts）
     this.description = mcpTool.description ?? `MCP tool: ${mcpTool.name}`
     this.input_schema = mcpTool.inputSchema
   }
@@ -325,58 +325,34 @@ client.on('notification', (notification) => {
 
 ### 8.1 加载配置
 
+真实入口 `getAllMcpConfigs()`（`config.ts:1256`）按作用域合并，企业配置存在时独占；同名合并时手动配置优先于 claude.ai 连接器：
+
 ```typescript
-export async function getAllMcpConfigs(): Promise<McpServerConfig[]> {
-  const configs: McpServerConfig[] = []
-  
-  // 1. 加载项目级配置
-  const projectConfig = await loadMcpConfig('.claude/mcp.json')
-  if (projectConfig) {
-    configs.push(...projectConfig.mcpServers)
+export async function getAllMcpConfigs(): Promise<{
+  servers: Record<string, ScopedMcpServerConfig>
+  errors: PluginError[]
+}> {
+  // 企业模式：不加载 claude.ai 服务器（企业有独占控制权）
+  if (doesEnterpriseMcpConfigExist()) {
+    return getClaudeCodeMcpConfigs()
   }
-  
-  // 2. 加载全局配置
-  const globalConfig = await loadMcpConfig('~/.claude/mcp.json')
-  if (globalConfig) {
-    configs.push(...globalConfig.mcpServers)
-  }
-  
-  // 3. 合并环境变量覆盖
-  const envConfigs = parseMcpEnvVars()
-  configs.push(...envConfigs)
-  
-  // 4. 按策略过滤
-  return filterMcpServersByPolicy(configs)
+
+  // 并行拉取 claude.ai 连接器配置（与本地加载重叠）
+  const claudeaiPromise = fetchClaudeAIMcpConfigsIfEligible()
+  const { servers: claudeCodeServers, errors } =
+    await getClaudeCodeMcpConfigs({}, claudeaiPromise)
+
+  // 按策略过滤 claude.ai 连接器，与手动配置去重后合并
+  // （claude.ai 优先级最低；同名时手动配置覆盖）
+  // ...
 }
 ```
+
+`getClaudeCodeMcpConfigs()` 内部按 scope 加载：enterprise → user（`~/.claude.json`）→ project（`.mcp.json`）→ local → 插件 MCP → dynamic（`--mcp-config`）。
 
 ### 8.2 策略过滤
 
-```typescript
-export function filterMcpServersByPolicy(
-  servers: McpServerConfig[],
-): McpServerConfig[] {
-  // 1. 获取策略限制
-  const policy = getCurrentPolicy()
-  
-  if (!policy.allowMcpServers) {
-    // 完全禁用
-    return []
-  }
-  
-  if (policy.allowedMcpServers) {
-    // 白名单模式
-    return servers.filter(s => policy.allowedMcpServers!.includes(s.name))
-  }
-  
-  if (policy.blockedMcpServers) {
-    // 黑名单模式
-    return servers.filter(s => !policy.blockedMcpServers!.includes(s.name))
-  }
-  
-  return servers
-}
-```
+`filterMcpServersByPolicy` 按托管策略（allowlist/blocklist）过滤服务器；当策略锁定 MCP 仅限插件（`isRestrictedToPluginOnly('mcp')`）时，user/project/local 来源会被清空，仅保留插件与企业服务器（见 `config.ts:1020-1050`）。
 
 ## 9. MCP 生命周期
 

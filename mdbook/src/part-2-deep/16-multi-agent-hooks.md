@@ -41,14 +41,16 @@ type AgentDefinition = {
 
 ### 1.3 内置 Agent 类型
 
-| Agent | 功能 | 允许的工具 |
+内置 Agent 主要用 **disallowedTools**（黑名单）而非白名单定义（`src/tools/AgentTool/built-in/*.ts`）：
+
+| Agent | 功能 | 工具限制（源码） |
 |-------|------|------------|
-| `generalPurpose` | 通用助手 | 除 ALL_AGENT_DISALLOWED_TOOLS 外所有 |
-| `claudeCodeGuide` | Claude Code 使用指南 | Read, Grep, Glob, Skill, ToolSearch |
-| `explore` | 代码探索 | Read, Grep, Glob, Bash(ls/find) |
-| `plan` | 制定计划 | Read, Grep, Glob, WebFetch |
-| `verification` | 验证结果 | Read, Grep, Glob, Bash(test/lint) |
-| `statuslineSetup` | 终端状态栏设置 | Bash, Read, Write |
+| `generalPurpose` | 通用助手 | 默认全量（受 ALL_AGENT_DISALLOWED_TOOLS 约束） |
+| `claudeCodeGuide` | Claude Code 使用指南 | `disallowedTools` 收窄为只读/检索类 |
+| `explore` | 代码探索 | 禁 Agent/ExitPlanMode/写工具（Edit/Write/NotebookEdit），保留 Bash 等只读能力 |
+| `plan` | 制定计划 | 同 explore（禁所有写工具），强调"只探索和规划" |
+| `verification` | 验证结果 | 禁写工具，保留运行测试/lint 的 Bash 能力 |
+| `statuslineSetup` | 终端状态栏设置 | 允许 Bash/Read/Write（需要写 shell 配置） |
 
 ### 1.4 自定义 Agent
 
@@ -57,7 +59,7 @@ type AgentDefinition = {
 ---
 name: my-reviewer
 description: 代码审查专家
-model: claude-opus-4-20250514
+model: opus
 tools:
   - Read
   - Grep
@@ -263,109 +265,102 @@ const HOOK_EVENTS = [
   'PostToolUse',             // 工具调用后（成功）
   'PostToolUseFailure',      // 工具调用后（失败）
 
-  // 会话钩子 (4)
+  // 通知与输入
+  'Notification',            // 通知
+  'UserPromptSubmit',        // 用户提交提示
+
+  // 会话钩子
   'SessionStart',            // 会话开始
   'SessionEnd',              // 会话结束
   'Stop',                    // Agent 停止
   'StopFailure',             // Agent 停止（失败）
 
-  // Agent 钩子 (2)
+  // Agent 钩子
   'SubagentStart',           // 子 Agent 启动
   'SubagentStop',            // 子 Agent 停止
 
-  // 压缩钩子 (2)
+  // 压缩钩子
   'PreCompact',              // 消息压缩前
   'PostCompact',             // 消息压缩后
 
-  // 权限钩子 (2)
+  // 权限钩子
   'PermissionRequest',       // 权限请求
   'PermissionDenied',        // 权限拒绝
 
-  // 用户钩子 (3)
-  'UserPromptSubmit',        // 用户提交提示
-  'Notification',            // 通知
-  'Setup',                   // 设置
-
-  // 任务钩子 (3)
+  // 初始化与任务
+  'Setup',                   // 设置钩子（init 触发）
+  'TeammateIdle',            // 队友空闲
   'TaskCreated',             // 任务创建
   'TaskCompleted',           // 任务完成
-  'TeammateIdle',            // 队友空闲
 
-  // 引导钩子 (2)
+  // 引导钩子
   'Elicitation',             // MCP Elicitation 请求
   'ElicitationResult',       // MCP Elicitation 结果
 
-  // 配置钩子 (1)
+  // 配置钩子
   'ConfigChange',            // 配置变更
 
-  // 工作树钩子 (2)
+  // 工作树钩子
   'WorktreeCreate',          // 工作树创建
   'WorktreeRemove',          // 工作树移除
 
-  // 环境钩子 (3)
+  // 环境钩子
   'InstructionsLoaded',      // 指令加载完成
   'CwdChanged',              // 工作目录变更
   'FileChanged',             // 文件变更
-]
+]  // 共 27 个（与 coreTypes.ts:25-53 一致）
 ```
 
 ### 5.3 Hook 注册
 
+真实配置结构支持四种 hook 类型（`src/utils/hooks/hooksSettings.ts:31-37`：command/prompt/agent/http），每条 hook 带 `matcher`（如 `Bash(git *)`）、`if` 条件与 timeout：
+
 ```typescript
-// 注册来源：
-// 1. SDK 回调（程序化注册）
-state.registeredHooks.sdk.push({
-  event: 'PreToolUse',
-  handler: async (context) => {
-    // 可以修改工具输入
-    // 可以阻止工具执行
-    // 可以记录使用情况
-  }
-})
+export type HookSource =
+  | EditableSettingSource        // user/project/local settings
+  | 'policySettings'             // 企业策略
+  | 'pluginHook'                 // 插件
+  | 'sessionHook'                // 会话注册（SDK）
+  | 'builtinHook'                // 内置（frontmatter hooks 等）
 
-// 2. 插件注册
-state.registeredHooks.plugins.push({
-  event: 'PostToolUse',
-  handler: async (context) => { ... }
-})
+export interface IndividualHookConfig {
+  event: HookEvent               // 27 个事件之一
+  config: HookCommand           // { type: 'command'|'prompt'|'agent'|'http', ... }
+  matcher?: string               // 工具匹配（如 "Bash(git *)"）
+  source: HookSource
+  pluginName?: string
+}
+```
 
-// 3. 配置文件注册 (~/.claude/settings.json)
+配置文件注册（`~/.claude/settings.json` / 项目 `.claude/settings.json`）：
+
+```json
 {
   "hooks": {
     "PreToolUse": [
-      { "command": "echo 'About to use tool: $TOOL_NAME'" }
+      {
+        "matcher": "Bash(git *)",
+        "hooks": [
+          { "type": "command", "command": "echo 'About to use tool'" }
+        ]
+      }
     ]
   }
 }
 ```
 
+（HookCommand 形状以 `src/utils/settings/types.ts` 为准；Skill frontmatter 也可声明 hooks。）
+
 ### 5.4 Hook 执行流程
 
+真实执行按 hook 类型分派（`src/utils/hooks/execAgentHook.ts`、`execHttpHook.ts`、`execPromptHook.ts`），hook 进程/请求通过 stdin JSON 事件 + 环境变量（`TOOL_NAME` 等）接收上下文；`AsyncHookRegistry` 负责并发与超时：
+
 ```typescript
-async function runHooks(eventType: string, context: HookContext) {
-  const hooks = getRegisteredHooks(eventType)
-
-  for (const hook of hooks) {
-    if (hook.type === 'sdk') {
-      // SDK hook: 直接调用
-      const result = await hook.handler(context)
-      if (result?.block) return result  // 阻止后续执行
-      if (result?.modifiedInput) context.input = result.modifiedInput
-    }
-
-    if (hook.type === 'command') {
-      // 命令 hook: 执行 shell 命令
-      const result = await execa(hook.command, {
-        env: {
-          TOOL_NAME: context.toolName,
-          TOOL_INPUT: JSON.stringify(context.input),
-          ...
-        }
-      })
-      if (result.stdout.includes('BLOCK')) return { block: true }
-    }
-  }
-}
+// 结构示意：
+// 1. 按 event + matcher 过滤出命中的 hooks
+// 2. 逐个执行（command → shell；http → fetch；agent/prompt → LLM sideQuery）
+// 3. 解析退出码 / stdout JSON 决策（deny/block 等语义随事件不同）
+// 4. 失败降级：PreToolUse hooks 崩溃 → auto-deny 而不是 crash（permissions.ts:465）
 ```
 
 ### 5.5 权限系统中的 Hooks

@@ -45,7 +45,7 @@ exec bun --env-file=.env ./src/entrypoints/cli.tsx "$@"
 ### 1.3 CLI 引导器 (cli.tsx)
 
 ```typescript
-// src/entrypoints/cli.tsx (303 行)
+// src/entrypoints/cli.tsx (302 行)
 // 设计哲学：最小化模块加载，快速路径零依赖
 
 async function main(): Promise<void> {
@@ -226,7 +226,7 @@ export async function setup(cwd, permissionMode, ...): Promise<void> {
 ### 1.8 交互式前置对话框 (showSetupScreens)
 
 ```typescript
-// src/interactiveHelpers.tsx (366 行)
+// src/interactiveHelpers.tsx (365 行)
 
 async function showSetupScreens(root): Promise<SessionConfig> {
   // 1. 信任对话框 (是否信任此项目的 .claude/ 配置?)
@@ -242,7 +242,7 @@ async function showSetupScreens(root): Promise<SessionConfig> {
 ### 1.9 REPL 启动
 
 ```typescript
-// src/replLauncher.tsx (23 行)
+// src/replLauncher.tsx (22 行)
 async function launchRepl(appProps, replProps) {
   // 动态导入 (延迟重模块加载)
   const { App } = await import('../components/App.js')
@@ -614,13 +614,13 @@ program.parse()
 | 文件 | 行数 | 功能 |
 |------|------|------|
 | `bin/claude-haha` | - | Shell 入口脚本 |
-| `src/entrypoints/cli.tsx` | 303 | CLI 引导器（快速路径路由） |
+| `src/entrypoints/cli.tsx` | 302 | CLI 引导器（快速路径路由） |
 | `src/entrypoints/init.ts` | 340 | 13 步完整初始化 |
 | `src/main.tsx` | 4748 | 主程序（Commander + 选项解析） |
 | `src/setup.ts` | 493 | 工作目录/权限/MCP 初始化 |
-| `src/interactiveHelpers.tsx` | 366 | 前置对话框流程 |
-| `src/replLauncher.tsx` | 23 | REPL 启动器 |
-| `src/screens/REPL.tsx` | 5003 | 主交互界面 |
+| `src/interactiveHelpers.tsx` | 365 | 前置对话框流程 |
+| `src/replLauncher.tsx` | 22 | REPL 启动器 |
+| `src/screens/REPL.tsx` | 5002 | 主交互界面 |
 | `src/commands.ts` | 752 | 90+ 斜杠命令注册 |
 | `src/keybindings/schema.ts` | 236 | 按键绑定 schema |
 | `src/keybindings/defaultBindings.ts` | 340 | 默认按键绑定 |

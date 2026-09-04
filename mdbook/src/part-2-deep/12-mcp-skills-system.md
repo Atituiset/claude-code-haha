@@ -221,29 +221,24 @@ Skills 是一种声明式的 Agent 能力扩展机制。一个 Skill 是一个 M
 ```
 .claude/skills/
   ├── my-skill/
-  │   ├── skill.md          # Skill 定义（frontmatter + 内容）
-  │   └── helper.ts         # 可选：辅助脚本
-  ├── code-review.md        # 简单 Skill
+  │   ├── SKILL.md          # Skill 定义（frontmatter + 内容）
+  │   └── references/       # 可选：参考文件（按需加载）
+  ├── code-review.md        # 单文件 Skill
   └── testing-guide.md
 ```
 
-### 2.2 Skill Frontmatter
+### 2.2 Skill Frontmatter（真实字段，`src/skills/loadSkillsDir.ts:197-260`）
 
 ```yaml
 ---
 name: code-review
 description: 执行代码审查，检查安全、性能和可维护性问题
-triggers:
-  - "review code"
-  - "code review"
-  - "检查代码"
-tools:
-  - Bash
-  - Read
-  - Grep
-  - Glob
-model: claude-opus-4-20250514    # 可选：指定模型
-kind: prompt                      # 类型: prompt | command
+when_to_use: 当用户要求审查代码、PR 或提交时
+allowed-tools: Bash, Read, Grep, Glob   # 可选：限制 Skill 执行期的可用工具
+model: opus                             # 可选：指定模型（别名或完整 ID）
+argument-hint: "[files]"                # 可选：/命令 参数提示
+disable-model-invocation: false         # 可选：禁止模型经 SkillTool 主动调用
+context: fork                           # 可选：fork 上下文执行
 ---
 
 # 代码审查 Skill
@@ -255,10 +250,12 @@ kind: prompt                      # 类型: prompt | command
 3. **可维护性检查**: ...
 ```
 
+> 注意：没有 `triggers`/`kind` 字段。`when_to_use` 供 SkillTool 的模型侧匹配，用户侧入口是 `/skill-name` 命令。hooks 也可以通过 frontmatter 声明（HooksSchema 解析，`loadSkillsDir.ts:133`）。
+
 ### 2.3 Skill 加载
 
 ```typescript
-// src/skills/loadSkillsDir.ts (~700+ 行)
+// src/skills/loadSkillsDir.ts (1086 行)
 
 // Skill 来源（优先级从低到高）：
 // 1. 内置 Skills (bundled)
@@ -312,66 +309,46 @@ function loadSkillsFromDir(dir: string): Skill[] {
 
 ### 2.4 Skill 解析
 
+真实解析产出（`loadSkillsDir.ts:197-260`）：
+
 ```typescript
-function parseSkillMarkdown(content: string, filePath: string): Skill | null {
-  // 解析 frontmatter (YAML)
-  const { frontmatter, body } = parseFrontmatter(content)
-
-  // 验证必需字段
-  if (!frontmatter.name) return null
-
-  return {
-    name: frontmatter.name,
-    description: frontmatter.description ?? '',
-    triggers: frontmatter.triggers ?? [],
-    tools: frontmatter.tools ?? [],
-    model: frontmatter.model,
-    kind: frontmatter.kind ?? 'prompt',
-    content: body,                  // Markdown 正文作为 Skill 指令
-    source: detectSource(filePath), // 'user' | 'project' | 'plugin' | 'managed'
-    filePath,
-  }
+// 关键字段（真实集合）
+{
+  name: frontmatter.name,
+  description: frontmatter.description ?? '',
+  whenToUse: frontmatter.when_to_use,       // 模型侧匹配依据
+  allowedTools: parseAllowedTools(frontmatter), // allowed-tools
+  model: frontmatter.model,
+  disableModelInvocation: parseBooleanFrontmatter(...),
+  hooks: parseSkillHooks(frontmatter),      // HooksSchema 校验
+  paths: parseSkillPaths(frontmatter),      // CLAUDE.md 风格路径规则
+  content: body,                            // Markdown 正文（调用时才完整加载）
+  source: detectSource(filePath),           // 'user' | 'project' | 'plugin' | 'managed'
+  filePath,
 }
 ```
+
+性能优化：启动时只解析 frontmatter 估算 token（`loadSkillsDir.ts:97-104`），正文延迟到首次调用时加载。
 
 ### 2.5 Skill 执行
 
-Skill 通过 SkillTool 向 Agent 暴露：
+Skill 通过 SkillTool（工具名 `Skill`，`src/tools/SkillTool/SkillTool.ts:331`）向 Agent 暴露。没有 `kind: command` 执行 shell 脚本的分支——Skill 只有"内容注入"一种执行语义：
 
 ```typescript
-// src/tools/SkillTool/
-const SkillTool = {
-  name: 'Skill',
-  description: 'Invoke a named skill with arguments',
-  input_schema: {
-    type: 'object',
-    properties: {
-      name: { type: 'string', description: 'Skill name' },
-      args: { type: 'string', description: 'Arguments to pass' },
-    },
-    required: ['name'],
-  },
-  async call(input, context) {
-    const skill = findSkill(input.name)
-    if (!skill) throw new Error(`Skill not found: ${input.name}`)
-
-    // Skill 内容注入到系统提示或作为用户消息
-    if (skill.kind === 'prompt') {
-      // prompt 类型：将 Skill 内容注入对话
-      return {
-        content: skill.content,
-        systemPrompt: skill.model ? `Use ${skill.model} for this task` : undefined,
-      }
-    }
-
-    if (skill.kind === 'command') {
-      // command 类型：执行关联的 shell 脚本
-      const result = await executeShellScript(skill, input.args)
-      return { content: result }
-    }
-  }
-}
+// src/tools/SkillTool/SkillTool.ts（结构示意）
+const SkillTool = buildTool({
+  name: SKILL_TOOL_NAME,        // 'Skill'（SkillTool/constants.ts）
+  // input: skill 名 + 参数
+  // call():
+  //   1. 按名字查找 Skill（含 discoveredSkillNames/官方市场/插件来源分流）
+  //   2. 加载 Skill 正文（延迟加载，见 2.4）
+  //   3. 把正文（替换 $ARGUMENTS 等占位符）作为工具结果注入对话
+  //      → 模型按 Skill 指令，通过受限工具集（allowed-tools）继续执行
+  //   4. 遥测记录 command_name / plugin_name 等
+})
 ```
+
+Skill 指定的 `model` 影响该 Skill 执行时的模型选择，`context: fork` 则在 fork 的子上下文中运行。
 
 ### 2.6 MCP Skill Builder
 
@@ -481,31 +458,21 @@ export function connectRemoteControl(config): RemoteControl
 ### 4.2 Hook 事件类型
 
 ```typescript
-// src/entrypoints/sdk/coreTypes.ts
+// src/entrypoints/sdk/coreTypes.ts:25-53（完整列表，27 个）
 const HOOK_EVENTS = [
-  // 工具钩子
   'PreToolUse', 'PostToolUse', 'PostToolUseFailure',
-  // 会话钩子
+  'Notification', 'UserPromptSubmit',
   'SessionStart', 'SessionEnd', 'Stop', 'StopFailure',
-  // Agent 钩子
   'SubagentStart', 'SubagentStop',
-  // 压缩钩子
   'PreCompact', 'PostCompact',
-  // 权限钩子
   'PermissionRequest', 'PermissionDenied',
-  // 用户钩子
-  'UserPromptSubmit', 'Notification', 'Setup',
-  // 任务钩子
-  'TaskCreated', 'TaskCompleted', 'TeammateIdle',
-  // 引导钩子
+  'Setup', 'TeammateIdle',
+  'TaskCreated', 'TaskCompleted',
   'Elicitation', 'ElicitationResult',
-  // 配置钩子
   'ConfigChange',
-  // 工作树钩子
   'WorktreeCreate', 'WorktreeRemove',
-  // 环境钩子
   'InstructionsLoaded', 'CwdChanged', 'FileChanged',
-]  // 27 个事件类型
+] as const  // 27 个事件类型
 ```
 
 ## 5. 插件系统
@@ -587,7 +554,7 @@ function loadSkill(filePath: string): Skill {
 | `src/services/mcp/client.ts` | ~1000+ | MCP 客户端核心 |
 | `src/services/mcp/types.ts` | - | MCP 类型定义 |
 | `src/services/mcp/MCPConnectionManager.tsx` | - | 连接生命周期管理 |
-| `src/skills/loadSkillsDir.ts` | ~700+ | Skill 加载和解析 |
+| `src/skills/loadSkillsDir.ts` | 1086 | Skill 加载和解析 |
 | `src/skills/mcpSkillBuilders.ts` | - | MCP→Skill 转换 |
 | `src/skills/mcpSkills.ts` | - | MCP Skills (stub) |
 | `src/entrypoints/mcp.ts` | 196 | MCP Server 模式 |

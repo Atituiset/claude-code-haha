@@ -53,7 +53,7 @@ stateDiagram-v2
 ### 3.1 完整流程
 
 ```typescript
-// src/query.ts (~2800+ 行)
+// src/query.ts (1729 行；queryLoop 为内部主循环)
 export async function* query(
   userMessage: UserMessage,
   options: QueryOptions,
@@ -294,7 +294,7 @@ async function* queryModelWithStreaming(
 
 ```typescript
 // 如果在指定时间内没有收到任何流事件，触发超时
-const STREAM_IDLE_TIMEOUT_MS = 30_000  // 30 秒
+const STREAM_IDLE_TIMEOUT_MS = 90_000  // 90s（CLAUDE_STREAM_IDLE_TIMEOUT_MS 可覆盖；另 STALL_THRESHOLD_MS = 30s）
 
 // 看门狗逻辑：每个事件重置计时器，超时则中止请求
 const idleTimer = setTimeout(() => {
@@ -348,7 +348,7 @@ async function runTools(
 当模型还在流式输出时，某些工具调用可以被提前识别并开始执行：
 
 ```typescript
-// src/services/tools/StreamingToolExecutor.ts (~350 行)
+// src/services/tools/StreamingToolExecutor.ts (530 行)
 class StreamingToolExecutor {
   // 在流式输出过程中，一旦完整的 tool_use block 到达
   // （content_block_stop 事件），立即开始执行
@@ -367,7 +367,7 @@ class StreamingToolExecutor {
 ### 5.3 单工具执行 (runToolUse)
 
 ```typescript
-// src/services/tools/toolExecution.ts (~1600+ 行)
+// src/services/tools/toolExecution.ts (1745 行)
 async function runToolUse(
   block: ToolUseBlock,
   config: QueryConfig,
@@ -426,7 +426,7 @@ async function runToolUse(
 当 Agent Loop 正常退出（`stop_reason === 'end_turn'`）时，系统执行一系列停止后处理：
 
 ```typescript
-// src/query/stopHooks.ts (~400+ 行)
+// src/query/stopHooks.ts (473 行)
 async function* handleStopHooks(state: State): AsyncGenerator<HookEvent> {
   // 1. 提取记忆
   yield* extractMemories(state.messages)
@@ -589,17 +589,17 @@ async function* agentLoop(
 
 | 文件 | 行数 | 功能 |
 |------|------|------|
-| `src/query.ts` | ~2800+ | Agent 主循环 async generator |
+| `src/query.ts` | 1729 | Agent 主循环 async generator |
 | `src/QueryEngine.ts` | ~1295 | 会话编排，用户输入到响应的生命周期 |
 | `src/query/config.ts` | - | QueryConfig 不可变快照 |
 | `src/query/deps.ts` | - | QueryDeps 依赖注入类型 |
-| `src/query/stopHooks.ts` | ~400+ | 停止钩子处理 |
+| `src/query/stopHooks.ts` | 473 | 停止钩子处理 |
 | `src/query/tokenBudget.ts` | - | BudgetTracker token 预算追踪 |
 | `src/query/transitions.ts` | - | 状态转换逻辑 (stub) |
 | `src/services/api/claude.ts` | ~3489 | API 流式调用、重试、缓存控制 |
 | `src/services/api/client.ts` | - | Anthropic 客户端初始化和 provider 路由 |
 | `src/services/tools/toolOrchestration.ts` | - | 工具编排（并发/独占分区） |
-| `src/services/tools/toolExecution.ts` | ~1600+ | 单工具执行（权限、hooks、遥测） |
-| `src/services/tools/StreamingToolExecutor.ts` | ~350 | 流式工具提前执行 |
+| `src/services/tools/toolExecution.ts` | 1745 | 单工具执行（权限、hooks、遥测） |
+| `src/services/tools/StreamingToolExecutor.ts` | 530 | 流式工具提前执行 |
 | `src/utils/sideQuery.ts` | 236 | 旁路查询（分类器等） |
 | `src/utils/messages.ts` | ~5512 | 消息类型、规范化、API 准备 |

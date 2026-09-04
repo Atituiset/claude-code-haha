@@ -8,31 +8,25 @@ Claude Code 通过 HTTP API 与 Anthropic 的 Claude 模型通信。API 层封�
 
 ### 2.1 客户端初始化
 
-```typescript
-// src/services/api/client.ts
-import Anthropic from '@anthropic-ai/sdk'
+真实入口是 `getAnthropicClient()`（`src/services/api/client.ts:112`），按 Provider 分支构造（详见第 11 章 Provider 路由）：
 
-export function createApiClient(config: ApiClientConfig): Anthropic {
-  return new Anthropic({
-    apiKey: config.apiKey,
-    baseURL: config.baseURL,
-    timeout: config.timeout ?? 600_000,
-    maxRetries: config.maxRetries ?? 3,
-  })
+```typescript
+export async function getAnthropicClient({ apiKey }: { apiKey?: string } = {}): Promise<Anthropic> {
+  // 依次检查：CLAUDE_CODE_USE_BEDROCK → Bedrock SDK
+  //           CLAUDE_CODE_USE_FOUNDRY → Foundry（Azure）
+  //           CLAUDE_CODE_USE_VERTEX  → Vertex（GoogleAuth）
+  //           OpenAI Responses 模型 → OpenAI 兼容客户端
+  //           默认 → new Anthropic({ apiKey: resolveAnthropicClientApiKey(...) })
+  // timeout: API_TIMEOUT_MS（默认 600s）
 }
 ```
 
-### 2.2 配置来源
+### 2.2 认证来源（`client.ts:96`）
 
 ```typescript
-function getApiConfig(): ApiClientConfig {
-  return {
-    apiKey: process.env.ANTHROPIC_API_KEY ?? process.env.ANTHROPIC_AUTH_TOKEN!,
-    baseURL: process.env.ANTHROPIC_BASE_URL ?? 'https://api.anthropic.com',
-    timeout: parseInt(process.env.API_TIMEOUT_MS ?? '600000', 10),
-    maxRetries: 3,
-  }
-}
+// ANTHROPIC_AUTH_TOKEN 存在且无显式 key/API_KEY → 走 auth token 路径
+// 显式 apiKey > ANTHROPIC_API_KEY > OAuth token（Claude.ai 订阅）
+//   > apiKeyHelper（settings 配置的辅助程序）
 ```
 
 ## 3. 查询执行 (`src/query.ts`)
@@ -248,328 +242,133 @@ function groupByParallelism(inputs: ToolInput[]): ToolGroup[] {
 }
 ```
 
-## 5. 推测执行 (Speculation)
+## 5. 推测执行 (Speculation / Prompt Suggestion)
 
-### 5.1 概念
+### 5.1 真实概念
 
-推测执行允许 Claude Code 在用户确认前"预执行"工具调用，提供更流畅的体验：
+推测执行**不是**"用户确认前预执行工具调用"，而是 **Prompt Suggestion 机制**（`src/services/PromptSuggestion/speculation.ts`）：在用户输入前，对预测的下一轮提示词跑一个完整的后台 Agent Loop（speculative decoding 的 Agent 版）：
 
 ```
-User: "Create a new file"
+上一轮对话结束
          │
          ▼
-┌─────────────────┐
-│  API Response   │  ← 模型返回工具调用
-│  (speculative)  │
-└────────┬────────┘
+预测用户下一输入（提示建议）
          │
          ▼
-┌─────────────────┐
-│  Speculation    │  ← 显示推测状态
-│  State         │
-└────────┬────────┘
+后台 speculative query loop（受限工具集）
+  - 只读工具直接执行
+  - 写工具（Edit/Write/NotebookEdit）写入 overlay 目录
          │
          ▼
-┌─────────────────┐
-│  Execute Tool   │  ← 执行工具（可隐藏）
-│  (in background)│
-└────────┬────────┘
-         │
-         ▼
-┌─────────────────┐
-│  User Confirm   │  ← 显示结果
-│  (or cancel)    │
-└─────────────────┘
+用户实际输入 == 建议？
+  ├─ 是 → 接受：overlay 写入复制回主工作区，跳过整轮计算
+  └─ 否 → 丢弃：删除 overlay，正常执行
 ```
 
-### 5.2 推测状态
+### 5.2 关键约束（`speculation.ts:15-28`）
 
 ```typescript
-interface Speculation {
-  toolName: string
-  toolParams: Record<string, unknown>
-  status: 'pending' | 'executing' | 'completed' | 'cancelled'
-  result?: ToolResult
-  startTime: number
-}
+const MAX_SPECULATION_TURNS = 20        // 最多 20 轮
+const MAX_SPECULATION_MESSAGES = 100
+
+const WRITE_TOOLS = new Set(['Edit', 'Write', 'NotebookEdit'])
+// 写操作进入 overlay（临时目录），接受前不影响真实工作区
+const SAFE_READ_ONLY_TOOLS = new Set([
+  'Read', 'Glob', 'Grep', 'ToolSearch', 'LSP', 'TaskGet', 'TaskList',
+])
 ```
 
-### 5.3 推测执行流程
+### 5.3 状态机（`src/state/AppStateStore.ts:58`）
 
 ```typescript
-async function executeWithSpeculation(
-  toolInputs: ToolInput[],
-  context: ExecutionContext,
-): Promise<QueryResult> {
-  const speculation: Speculation[] = toolInputs.map(input => ({
-    toolName: input.name,
-    toolParams: input.params,
-    status: 'pending',
-    startTime: Date.now(),
-  }))
-  
-  // 1. 更新状态为推测中
-  updateAppState({ speculation })
-  
-  // 2. 后台执行工具
-  const toolResults = await runTools(toolInputs, context)
-  
-  // 3. 清除推测状态
-  updateAppState({ speculation: null })
-  
-  // 4. 返回结果
-  return {
-    toolResults,
-    speculation: undefined,
-  }
-}
+export type SpeculationState =
+  | { status: 'idle' }          // 空闲
+  | { status: 'active', ... }   // 建议/执行/等待接受
+  | { status: '...', ... }      // 详见源码
+// 会话累计节省时间记录于 speculationSessionTimeSavedMs
 ```
 
 ## 6. 重试机制 (`src/services/api/withRetry.ts`)
 
-### 6.1 重试策略
+真实的 `withRetry` 是一个高阶 async generator（逐事件透传流式响应，同时处理重试、认证降级、Fast Mode 冷却等），核心要点（`withRetry.ts:50-730`）：
+
+### 6.1 重试判定要点
+
+- **重试源**：SDK 的 `APIConnectionError`、`APIError`（429/500 级）、`overloaded_error`（含 529，通过消息内容探测，`withRetry.ts:615-622`）
+- **认证特殊路径**：401 触发 `handleOAuth401Error`（OAuth token 刷新），AWS/GCP 凭证错误有独立清理逻辑（`clearAwsCredentialsCache` 等）
+- **Fast Mode 冷却**：429/overload 可能触发 fast mode cooldown 而非直接重试
+- **持久模式**：429/529 始终可重试并绕过订阅者门控（`withRetry.ts:702`）
+- 重试间退避为指数增长（`sleep`），并伴随 `tengu_api_*` 遥测事件（如 `tengu_api_custom_529_overloaded_error`）
+
+### 6.2 结构示意
 
 ```typescript
-interface RetryConfig {
-  maxRetries: number
-  initialDelayMs: number
-  maxDelayMs: number
-  backoffMultiplier: number
-  retryableErrors: string[]
-}
-
-const DEFAULT_RETRY_CONFIG: RetryConfig = {
-  maxRetries: 3,
-  initialDelayMs: 1000,
-  maxDelayMs: 30000,
-  backoffMultiplier: 2,
-  retryableErrors: [
-    'ECONNRESET',
-    'ETIMEDOUT',
-    '429',
-    '500',
-    '502',
-    '503',
-    '504',
-  ],
+async function* withRetry(messages, fn, config) {
+  // for attempt in retries:
+  //   try:
+  //     for await (const event of await fn()) yield event   // 透传流
+  //   catch (error):
+  //     if (!isRetryableError(error)) throw
+  //     handleOAuth401 / credentials 清理 / fastMode cooldown
+  //     await sleep(backoff)
 }
 ```
 
-### 6.2 重试实现
-
-```typescript
-async function withRetry<T>(
-  fn: () => Promise<T>,
-  config: RetryConfig = DEFAULT_RETRY_CONFIG,
-): Promise<T> {
-  let lastError: Error | undefined
-  let delay = config.initialDelayMs
-  
-  for (let attempt = 0; attempt <= config.maxRetries; attempt++) {
-    try {
-      return await fn()
-    } catch (error) {
-      lastError = error
-      
-      if (!isRetryable(error, config.retryableErrors)) {
-        throw error
-      }
-      
-      if (attempt < config.maxRetries) {
-        await sleep(delay)
-        delay = Math.min(delay * config.backoffMultiplier, config.maxDelayMs)
-      }
-    }
-  }
-  
-  throw lastError
-}
-```
-
-### 6.3 错误判断
-
-```typescript
-function isRetryable(error: Error, retryableErrors: string[]): boolean {
-  // 1. 检查错误码
-  if (retryableErrors.includes(getErrorCode(error))) {
-    return true
-  }
-  
-  // 2. 检查 HTTP 状态码
-  if (error instanceof ApiError) {
-    if (retryableErrors.includes(String(error.status))) {
-      return true
-    }
-  }
-  
-  // 3. 检查速率限制
-  if (error instanceof RateLimitError) {
-    return true
-  }
-  
-  return false
-}
-```
+> 注意：不存在文档早期版本虚构的 `DEFAULT_RETRY_CONFIG`/`retryableErrors` 字符串数组——可重试性由 SDK 错误类型与状态码分支逻辑决定。
 
 ## 7. 错误处理 (`src/services/api/errors.ts`)
 
-### 7.1 错误类型
+### 7.1 真实结构
+
+错误类型直接复用 SDK 的 `APIError`/`APIConnectionError`/`APIConnectionTimeoutError`，`errors.ts` 不定义自定义错误类层级，而是提供**面向用户的错误消息构造**（`REPEATED_529_ERROR_MESSAGE` 等）与错误→AssistantMessage 转换：
 
 ```typescript
-class ApiError extends Error {
-  constructor(
-    public status: number,
-    message: string,
-    public code?: string,
-  ) {
-    super(message)
-    this.name = 'ApiError'
-  }
-}
+// src/services/api/errors.ts
+import { APIConnectionError, APIConnectionTimeoutError, APIError }
+  from '@anthropic-ai/sdk'
 
-class RateLimitError extends ApiError {
-  constructor(
-    public retryAfterMs: number,
-  ) {
-    super(429, 'Rate limit exceeded')
-    this.name = 'RateLimitError'
-  }
-}
-
-class AuthenticationError extends ApiError {
-  constructor() {
-    super(401, 'Authentication failed')
-    this.name = 'AuthenticationError'
-  }
-}
-
-class ValidationError extends ApiError {
-  constructor(
-    public validationErrors: ValidationError[],
-  ) {
-    super(400, 'Invalid request')
-    this.name = 'ValidationError'
-  }
-}
+// 关键职责：
+// - 401 → OAuth/订阅诊断（getClaudeAIOAuthTokens / isClaudeAISubscriber）
+// - 413/429/500/529 → 人类可读的重试/降级提示
+// - 图片/PDF 超限（ImageResizeError、API_PDF_MAX_PAGES）→ 指导性错误
+// - 生成 createAssistantAPIErrorMessage 消息注入对话
 ```
 
-### 7.2 错误处理流程
+### 7.2 认证降级路径
 
-```typescript
-async function handleApiError(
-  error: Error,
-  context: ErrorContext,
-): Promise<ErrorResult> {
-  if (error instanceof AuthenticationError) {
-    // 清除认证信息，提示重新登录
-    clearAuthTokens()
-    return {
-      type: 'auth_error',
-      message: 'Please login again: /login',
-      action: 'reauthenticate',
-    }
-  }
-  
-  if (error instanceof RateLimitError) {
-    // 显示速率限制信息
-    return {
-      type: 'rate_limit',
-      message: `Rate limit exceeded. Retry after ${error.retryAfterMs / 1000}s`,
-      action: 'wait',
-      retryAfter: error.retryAfterMs,
-    }
-  }
-  
-  if (error instanceof ValidationError) {
-    // 显示验证错误详情
-    return {
-      type: 'validation_error',
-      message: formatValidationErrors(error.validationErrors),
-      action: 'fix_input',
-    }
-  }
-  
-  // 未知错误
-  logError(error)
-  return {
-    type: 'unknown_error',
-    message: error.message,
-    action: 'retry',
-  }
-}
-```
+认证错误（401）在 `withRetry.ts` 中走专门路径：`handleOAuth401Error` 尝试刷新 token；失败后按订阅状态（Claude.ai subscriber / enterprise）给出相应提示；AWS/GCP 凭证缓存被清理以在重试时重新获取。
 
 ## 8. 上下文窗口管理
 
-### 8.1 上下文窗口限制
+### 8.1 上下文窗口（真实来源 `src/utils/model/modelContextWindows.ts`）
 
 ```typescript
-interface ContextWindow {
-  model: string
-  maxTokens: number
-  currentTokens: number
-  remainingTokens: number
+const DIRECT_MODEL_CONTEXT_WINDOWS: Record<string, number> = {
+  'claude-opus-4-7': 1_000_000,
+  'claude-sonnet-4-6': 200_000,
+  'claude-haiku-4-5': 200_000,
+  'deepseek-v4-pro': 1_000_000,
+  'kimi-k2.6': 262_144,
+  'glm-5': 200_000,
+  // ...
 }
-
-function getContextWindow(model: string): ContextWindow {
-  const limits = {
-    'claude-opus-4-7-20251120': { maxTokens: 200000 },
-    'claude-sonnet-4-7-20251120': { maxTokens: 200000 },
-    'claude-haiku-4-7-20251120': { maxTokens: 200000 },
-  }
-  
-  return limits[model] ?? { maxTokens: 100000 }
-}
+// 另有 PATTERN_MODEL_CONTEXT_WINDOWS 按 provider 前缀匹配
+// 可用 CLAUDE_CODE_MODEL_CONTEXT_WINDOWS 环境变量覆盖
+// 上限 10M、下限 16K（MODEL_CONTEXT_WINDOW_MIN/MAX）
 ```
 
-### 8.2 上下文压缩
+### 8.2 多级压缩（真实层级）
 
-```typescript
-interface CompactOptions {
-  targetTokens: number
-  preserveRecent: number
-  strategy: 'summary' | 'truncate' | 'mixed'
-}
+压缩不是 `strategy: 'summary'|'truncate'|'mixed'` 单一策略，而是**四级递进**（`src/query.ts:397-468`、`src/services/compact/autoCompact.ts`）：
 
-async function compactContext(
-  messages: Message[],
-  options: CompactOptions,
-): Promise<Message[]> {
-  const currentTokens = await countTokens(messages)
-  
-  if (currentTokens <= options.targetTokens) {
-    return messages
-  }
-  
-  // 1. 保留最近的 N 条消息
-  const recentMessages = messages.slice(-options.preserveRecent)
-  
-  // 2. 压缩旧消息
-  const olderMessages = messages.slice(0, -options.preserveRecent)
-  const compactedOlder = await compactMessages(olderMessages, {
-    targetTokens: options.targetTokens - countTokens(recentMessages),
-    strategy: options.strategy,
-  })
-  
-  return [...compactedOlder, ...recentMessages]
-}
+| 层级 | 触发时机 | 做什么 |
+|------|----------|--------|
+| Micro-compact（partialCompact） | 每轮循环前检查 | 对最旧消息段落做部分压缩 |
+| Tool-call collapse | autocompact 之前 | 折叠冗余 tool_use/tool_result 对（若已低于阈值则 autocompact 为 no-op） |
+| Auto-compact | token 阈值触发 | 调 LLM 生成对话摘要替换旧消息，保留最近上下文 |
+| Emergency/reactive compact | API 报 prompt-too-long | 立即压缩后重试 |
 
-async function compactMessages(
-  messages: Message[],
-  options: { targetTokens: number; strategy: string },
-): Promise<Message[]> {
-  switch (options.strategy) {
-    case 'summary':
-      return await summarizeMessages(messages, options.targetTokens)
-    
-    case 'truncate':
-      return truncateMessages(messages, options.targetTokens)
-    
-    case 'mixed':
-      return await mixedCompact(messages, options.targetTokens)
-  }
-}
-```
+`deps.microcompact` / `deps.autocompact` 通过 `productionDeps()` 注入（详见第 09 章 QueryDeps）。
 
 ## 9. 流式响应 (`src/services/api/stream.ts`)
 
@@ -668,53 +467,32 @@ function logRequest(request: RequestLog): void {
 
 ## 11. 查询配置 (`src/query/config.ts`)
 
-### 11.1 查询配置构建
+### 11.1 QueryConfig 不可变快照（真实结构）
+
+QueryConfig 不含 temperature/topP 等采样参数——它是**运行时门控快照**（`src/query/config.ts:29`），每次 `query()` 调用时创建一次，防止循环中途门控变化：
 
 ```typescript
-interface QueryConfig {
-  model: string
-  temperature: number
-  topP: number
-  topK: number
-  maxTokens: number
-  stopSequences: string[]
-  tools: Tool[]
-}
-
-export function buildQueryConfig(
-  options: QueryOptions,
-): QueryConfig {
-  return {
-    model: options.model ?? getMainLoopModel(),
-    temperature: options.temperature ?? 1.0,
-    topP: options.topP ?? 1.0,
-    topK: options.topK ?? 250,
-    maxTokens: options.maxTokens ?? 4096,
-    stopSequences: options.stopSequences ?? [],
-    tools: options.tools ?? [],
+export type QueryConfig = {
+  sessionId: SessionId
+  gates: {
+    streamingToolExecution: boolean   // tengu_streaming_tool_execution2
+    emitToolUseSummaries: boolean     // CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES
+    isAnt: boolean                    // USER_TYPE === 'ant'
+    fastModeEnabled: boolean          // CLAUDE_CODE_DISABLE_FAST_MODE 反相
   }
 }
 ```
 
-### 11.2 模型选择逻辑
+（模型、工具、maxTokens、thinking 等查询参数在 `QueryParams` / `ToolUseContext.options` 上传递。）
 
-```typescript
-function selectModel(context: ModelSelectionContext): string {
-  // 1. 优先使用用户指定的模型
-  if (context.userSpecifiedModel) {
-    return context.userSpecifiedModel
-  }
-  
-  // 2. 根据任务类型选择
-  if (context.taskType === 'simple') {
-    return getDefaultHaikuModel()
-  }
-  
-  if (context.taskType === 'complex') {
-    return getDefaultOpusModel()
-  }
-  
-  // 3. 默认使用 Sonnet
-  return getDefaultSonnetModel()
-}
+### 11.2 模型选择链（真实优先级）
+
 ```
+--model CLI 参数 / SDK 指定
+  > 会话内 /model 切换（mainLoopModelOverride）
+  > ANTHROPIC_MODEL 环境变量
+  > 用户设置（settings.model）/ 项目设置
+  > 产品默认（Sonnet 4.6；Opus 别名 → 4.7）
+```
+
+别名解析见 `src/utils/model/model.ts:488-502`（sonnet/opus/haiku/best/opusplan，`[1m]` 后缀表示 1M 上下文），默认模型见 `getDefaultOpusModel/getDefaultSonnetModel`（`model.ts:110-140`）。

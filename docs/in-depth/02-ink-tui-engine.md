@@ -211,9 +211,9 @@ function InputHandler() {
 import { useStdin } from 'ink'
 
 function StdinReader() {
-  const { stdin, write } = useStdin()
+  const { stdin, isRawModeSupported, setRawMode } = useStdin()
   
-  // 可以监听数据事件
+  // stdin 是标准输入流，可监听数据事件（实际项目里用 useInput 更常见）
   stdin?.on('data', (data) => {
     console.log('Received:', data.toString())
   })
@@ -224,26 +224,17 @@ function StdinReader() {
 
 ### 5.3 useApp
 
-访问应用级别状态：
+访问应用上下文（注意：实际只暴露 `exit`，没有 `stdout`）：
 
 ```typescript
-import { useApp } from 'ink'
-
-function AppInfo() {
-  const { exit, stdout } = useApp()
-  
-  return (
-    <Box>
-      <Text>Exit: {typeof exit}</Text>
-      <Text>isTTY: {stdout.isTTY}</Text>
-    </Box>
-  )
-}
+// src/ink/hooks/use-app.ts
+const useApp = () => useContext(AppContext)
+// AppContext = { exit: (error?: Error) => void }
 ```
 
 ### 5.4 useAnimationFrame
 
-用于需要每帧更新的场景：
+用于需要每帧更新的场景（实现位于 `src/ink/hooks/use-animation-frame.ts`）：
 
 ```typescript
 import { useAnimationFrame } from 'ink'
@@ -337,18 +328,19 @@ setState({ count: 1 }) // 触发重新渲染，自动 diff
 
 **Ink:**
 ```tsx
-// 完全重新渲染（受控模式）
-// 需要手动调用 render() 更新
+// 同样是 React reconciler：setState 触发 re-render，
+// Ink 把输出 diff 到终端字符网格（而非 DOM）
+// 应用代码不需要手动调用 render()
 const root = await createRoot()
 await render(<App />, root)
-// 状态变化后不会自动更新
+// 之后组件内 setState 即可自动重绘
 ```
 
 ### 8.2 生命周期
 
 **React Web:** `componentDidMount` -> `componentDidUpdate` -> `componentWillUnmount`
 
-**Ink:** 无生命周期概念，使用 `useEffect` 模拟：
+**Ink:** 同样基于 React reconciler（`src/ink/reconciler.ts`），生命周期与 React 一致；函数组件使用 `useEffect`：
 
 ```typescript
 import { useEffect } from 'react'
@@ -380,23 +372,23 @@ function MyComponent() {
 
 ## 9. Claude Code 中的 TUI 架构
 
+REPL 的实际组件树（`src/screens/REPL.tsx`，~5000 行）比示意结构复杂得多，核心包括：
+
 ```
 src/screens/REPL.tsx
-  ├─> Header (状态栏)
-  ├─> MessageList (消息列表)
-  ├─> Composer (输入框)
-  ├─> NotificationOverlay (通知层)
-  └─> PermissionRequest (权限请求)
+  ├─> App (components/App.tsx, FpsMetricsProvider 等包裹)
+  ├─> VirtualMessageList (虚拟滚动消息列表)
+  ├─> PromptInput (components/PromptInput/, 输入框 + 各类选择器)
+  ├─> TeammateViewHeader (队友视图)
+  └─> 各类对话框 (权限/主题/模型选择等, components/*Dialog.tsx)
 ```
 
 ### 9.1 状态响应式更新
 
-Claude Code 使用 Zustand 进行状态管理：
+TUI 侧通过 React hooks + 自研轻量 store 订阅状态（`src/state/store.ts` 提供 `createStore`）：
 
 ```typescript
-import { useAppState } from '../state/AppStateStore.js'
-import { useSetAppState } from '../state/AppStateStore.js'
-
+// 组件中通过 useAppState 订阅
 function MessageList() {
   const messages = useAppState(s => s.messages)
   
@@ -410,32 +402,31 @@ function MessageList() {
 }
 ```
 
-状态变化时，`onChangeAppState` 触发重新渲染：
+状态写入的副作用集中在 `onChangeAppState`（`src/state/onChangeAppState.ts:43`）：
 
 ```typescript
-// src/state/onChangeAppState.js
-export function onChangeAppState(
-  store: Store,
-  partial: Partial<AppState> | ((prev: AppState) => Partial<AppState>),
-  shouldRender?: boolean,
-) {
-  store.setState(partial)
-  if (shouldRender !== false) {
-    requestAnimationFrame(() => {
-      root.render(<App />) // 触发重新渲染
-    })
-  }
+// src/state/onChangeAppState.ts
+export function onChangeAppState({
+  newState,
+  oldState,
+}: {
+  newState: AppState
+  oldState: AppState
+}) {
+  // 权限模式变化 → 通知 CCR 外部元数据与 SDK 状态流
+  // 模型变化 → 写回用户设置
+  // expandedView 变化 → 持久化 showExpandedTodos / showSpinnerTree
+  // ... 其余 diff 副作用
 }
 ```
+
+它不是"手动触发 Ink 重渲染"的函数——渲染由 React reconciler 的正常订阅机制驱动。
 
 ## 10. 调试技巧
 
 ### 10.1 查看渲染树
 
-```typescript
-import { debug } from 'ink'
-
-// 在组件外添加 debug 属性
+```tsx
 <Box debug>
   <Text>Inspect me</Text>
 </Box>
@@ -443,9 +434,17 @@ import { debug } from 'ink'
 
 ### 10.2 测量组件
 
-```typescript
-import measureElement from 'ink/measure-element.js'
+`measureElement` 是同步方法，通过 ref 调用（不是 await）：
 
-const dimensions = await measureElement(<MyComponent />)
-console.log(dimensions) // { width: 100, height: 20 }
+```typescript
+import { measureElement } from '../ink.js'
+
+function MyComponent() {
+  const ref = useRef<DOMElement>(null)
+  useEffect(() => {
+    const dimensions = measureElement(ref.current)
+    // → { width: number, height: number }
+  }, [])
+  return <Box ref={ref}>...</Box>
+}
 ```

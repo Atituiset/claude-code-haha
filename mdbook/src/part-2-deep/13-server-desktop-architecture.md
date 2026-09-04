@@ -9,27 +9,28 @@
 Server 是一个基于 Bun HTTP 的本地服务器，同时提供 REST API 和 WebSocket 通信，用于连接 CLI 和 Desktop 应用。
 
 ```typescript
-// src/server/index.ts
-const server = Bun.serve({
-  port: process.env.SERVER_PORT ?? 3456,
-  fetch(req, server) {
+// src/server/index.ts（结构示意，真实签名见 index.ts:37-155）
+const server = Bun.serve<WebSocketData>({
+  port: Number.parseInt(portArg || process.env.SERVER_PORT || '3456', 10),
+  idleTimeout: 60,
+  async fetch(req, server) {
     const url = new URL(req.url)
+    // CORS 预检 / Origin 校验（远程访问需 token 鉴权）
 
-    // WebSocket 升级
-    if (url.pathname === '/ws') {
-      return server.upgrade(req, { data: { ... } })
+    // WebSocket 升级：路径是 /ws/ 前缀（index.ts:179）
+    if (url.pathname.startsWith('/ws/')) {
+      // 鉴权后 server.upgrade(req, { data: {...} })
     }
 
-    // REST API 路由
+    // REST API 路由（router.ts）
     return router.handle(req)
   },
-  websocket: wsHandler,
 })
 ```
 
 ### 1.2 服务清单
 
-Server 实现了 28+ 个服务模块：
+`src/server/services/` 下有 30+ 个服务模块（`conversationService`、`sessionService`、`teamService`、`cronService`、`taskService`、`pluginService`、`providerService`、`settingsService`、`adapterService`、`agentService`、`diagnosticsService` 等；消息收发与权限请求走 WebSocket 事件而非独立 service）：
 
 | 服务 | 文件 | 功能 |
 |------|------|------|
@@ -47,9 +48,8 @@ Server 实现了 28+ 个服务模块：
 | **存储迁移** | `persistentStorageMigrations.ts` | 存储格式升级 |
 | **OAuth** | `hahaOAuthService.ts` | PKCE OAuth 流程 |
 | **会话管理** | `sessionService.ts` | 会话列表、创建、恢复 |
-| **消息服务** | `messageService.ts` | 消息发送和查询 |
-| **权限服务** | `permissionService.ts` | 权限请求/决策桥接 |
-| **工具服务** | `toolService.ts` | 工具列表和调用 |
+| **对话服务** | `conversationService.ts` | 会话消息发送/查询（配合 WS handler） |
+| **适配器** | `adapterService.ts` | IM 适配器（Telegram/飞书/钉钉/企微）管理 |
 
 ### 1.3 会话回退服务
 
@@ -148,12 +148,14 @@ async function search(query: string, options: SearchOptions) {
 
 ```
 Desktop App
-├── Frontend: React 19 + Zustand + i18n (EN/ZH)
+├── Frontend: React 18 + Zustand (v5) + i18n (EN/ZH)   # desktop/package.json
 ├── Native:   Tauri (Rust)
 ├── Build:    Vite
 ├── Test:     Vitest + Testing Library (jsdom)
 └── Communication: WebSocket → Server → CLI
 ```
+
+（根 CLI 侧的 React 是 19.x；Desktop 前端锁在 18.3.x。）
 
 ### 2.2 目录结构
 
@@ -162,9 +164,10 @@ desktop/
 ├── src/
 │   ├── api/              # API 客户端（与 Server 通信）
 │   ├── components/       # 共享 UI 组件
-│   ├── stores/           # Zustand 状态管理 (20 个 stores)
+│   ├── stores/           # Zustand 状态管理 (30+ 个 store 文件)
 │   ├── hooks/            # React hooks
-│   ├── i18n/             # 国际化 (EN/ZH)
+│   ├── i18n/             # 国际化 (locales, EN/ZH)
+│   ├── pages/            # 页面组件
 │   ├── types/            # TypeScript 类型
 │   ├── utils/            # 工具函数
 │   └── __tests__/        # 测试
@@ -181,22 +184,23 @@ desktop/
 
 ### 2.3 状态管理 (Zustand Stores)
 
-Desktop 使用 20+ 个 Zustand stores 管理状态：
+Desktop 使用 30+ 个 Zustand store 文件管理状态（`desktop/src/stores/`，含 `*.test.ts`）。真实清单（节选）：
 
 | Store | 功能 |
 |-------|------|
-| `sessionStore` | 会话列表、当前会话 |
-| `messageStore` | 消息列表、流式更新 |
-| `permissionStore` | 权限请求队列 |
-| `toolStore` | 工具列表和状态 |
+| `sessionStore` | 会话列表、当前会话、会话运行时（`sessionRuntimeStore`） |
+| `chatStore` | 消息、流式更新、对话状态 |
+| `adapterStore` | IM 适配器管理 |
+| `agentStore` | Agent/团队状态展示 |
+| `taskStore` / `cliTaskStore` | 后台任务与 CLI 任务 |
+| `tabStore` | 多标签页 |
 | `settingsStore` | 用户设置 |
-| `themeStore` | 主题配置 |
 | `mcpStore` | MCP 服务器状态 |
+| `pluginStore` / `skillStore` | 插件与 Skill |
 | `teamStore` | 团队和队友状态 |
-| `workspaceStore` | 工作区文件树 |
-| `diffStore` | 文件 diff 视图 |
-| `searchStore` | 搜索状态 |
-| `costStore` | 成本追踪 |
+| `workspacePanelStore` / `workspaceChatContextStore` | 工作区面板与上下文 |
+| `providerStore` / `hahaOAuthStore` | Provider 与 OAuth |
+| `uiStore` / `updateStore` / `terminalPanelStore` | UI、更新、终端面板 |
 
 ### 2.4 Tauri 集成
 
@@ -263,18 +267,38 @@ flowchart LR
 
 ### 3.3 WebSocket 协议
 
+真实事件类型定义在 `src/server/ws/events.ts:12-72`：
+
 ```typescript
-// 消息类型
-type WsMessage =
-  | { type: 'session_update', sessionId, data }
-  | { type: 'message', sessionId, message }
-  | { type: 'permission_request', requestId, tool, input }
-  | { type: 'permission_response', requestId, decision }
-  | { type: 'tool_start', sessionId, toolName }
-  | { type: 'tool_result', sessionId, result }
-  | { type: 'team_update', teamId, data }
-  | { type: 'computer_use_permission_request', requestId, ... }
-  | { type: 'notification', ... }
+// 客户端 → 服务器
+type ClientMessage =
+  | { type: 'prewarm_session' }
+  | { type: 'user_message'; content: string; attachments?: AttachmentRef[] }
+  | { type: 'permission_response'; ... }
+  | { type: 'computer_use_permission_response'; ... }
+  | { type: 'set_permission_mode'; mode: string }
+  | { type: 'set_runtime_config'; providerId: string | null; modelId: string }
+  | { type: 'stop_generation' }
+  | { type: 'ping' }
+
+// 服务器 → 客户端
+type ServerMessage =
+  | { type: 'connected'; sessionId: string }
+  | { type: 'content_start'; blockType: 'text' | 'tool_use'; ... }
+  | { type: 'content_delta'; text?: string; toolInput?: string }
+  | { type: 'tool_use_complete'; toolName; toolUseId; input; ... }
+  | { type: 'tool_result'; toolUseId; content; isError; ... }
+  | { type: 'permission_request'; ... }
+  | { type: 'computer_use_permission_request'; ... }
+  | { type: 'message_complete'; usage: TokenUsage }
+  | { type: 'thinking'; text: string }
+  | { type: 'status'; state: ChatState; verb?; elapsed?; tokens? }
+  | { type: 'error'; message; code; retryable? }
+  | { type: 'system_notification'; subtype; message?; data? }
+  | { type: 'team_update' | 'team_created' | 'team_deleted'; ... }
+  | { type: 'task_update'; taskId; status; progress? }
+  | { type: 'session_title_updated'; sessionId; title }
+  | { type: 'pong' }
 ```
 
 ### 3.4 UDS (Unix Domain Socket) 通信

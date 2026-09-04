@@ -67,49 +67,38 @@ export interface ToolInputJSONSchema {
 
 ### 3.1 注册流程 (`src/tools.ts`)
 
+真实签名只接收 permissionContext（`src/tools.ts:272`），MCP 工具的合并发生在 `assembleToolPool`：
+
 ```typescript
-export function getTools(
-  permissionContext: PermissionContext,
-  workspace: Workspace | null,
-): Tool[] {
-  const tools: Tool[] = []
-  
-  // 1. 添加基础工具
-  tools.push(...getAllBaseTools())
-  
-  // 2. 添加 MCP 工具
-  tools.push(...getMcpTools())
-  
-  // 3. 添加 Agent 相关工具
-  if (isAgentSwarmsEnabled()) {
-    tools.push(...getSwarmTools())
-  }
-  
-  // 4. 根据权限过滤
-  return filterToolsByPermissions(tools, permissionContext)
+export const getTools = (
+  permissionContext: ToolPermissionContext,
+): Tools => {
+  // Simple 模式: 仅 Bash/Read/Edit
+  const tools = getAllBaseTools()   // 静态导入 + 特性门控条件 require
+  // 过滤 deny 规则 + isEnabled()
+  return filterToolsByDenyRules(tools, permissionContext).filter(...)
 }
+
+// MCP 合并入口（src/tools.ts:338 附近）
+// 1. getTools() 获取内置工具
+// 2. MCP 工具按 deny 规则过滤
+// 3. 按工具名去重（内置优先）
+// 供 REPL 的 useMergedTools 和子 Agent 运行时共用
 ```
+
+许多工具是特性门控的条件加载（如 `SleepTool` 需要 `PROACTIVE`/`KAIROS`，cron 系列需要 `AGENT_TRIGGERS`），详见 `src/tools.ts` 顶部。
 
 ### 3.2 权限过滤
 
+工具级过滤只剔除被 deny 规则命中的工具；**单次调用**的 allow/ask 决策发生在执行期（`toolExecution.ts` 调 `hasPermissionsToUseTool`），不是注册期：
+
 ```typescript
-function filterToolsByPermissions(
-  tools: Tool[],
-  permissionContext: PermissionContext,
-): Tool[] {
-  return tools.filter(tool => {
-    // 跳过需要权限但未授权的工具
-    if (tool.requiresPermissions && !permissionContext.hasPermission(tool.name)) {
-      return false
-    }
-    
-    // 跳过危险工具
-    if (tool.dangerous && !permissionContext.allowDangerousTools) {
-      return false
-    }
-    
-    return true
-  })
+// src/tools.ts:264 附近
+function filterToolsByDenyRules<T extends { name: string }>(
+  tools: readonly T[],
+  permissionContext: ToolPermissionContext,
+): T[] {
+  return tools.filter(tool => !getDenyRuleForTool(permissionContext, tool))
 }
 ```
 
@@ -142,45 +131,34 @@ export async function executeQuery(
 }
 ```
 
-### 4.2 工具编排 (`src/services/tools/toolOrchestration.js`)
+### 4.2 工具编排 (`src/services/tools/toolOrchestration.ts`)
+
+真实实现按"连续并发安全批"分区执行，且是流式 async generator（逐个 yield 消息更新，而非攒齐返回）：
 
 ```typescript
-export async function runTools(
-  tools: Tool[],
-  inputs: ToolInput[],
-  context: ExecutionContext,
-): Promise<ToolResult[]> {
-  const results: ToolResult[] = []
-  
-  for (const input of inputs) {
-    // 1. 查找工具
-    const tool = tools.find(t => t.name === input.name)
-    if (!tool) {
-      results.push({
-        tool_use_id: input.tool_use_id,
-        content: `Error: Tool not found: ${input.name}`,
-        is_error: true,
-      })
-      continue
-    }
-    
-    // 2. 执行工具（可并行或串行）
-    if (input.parallel) {
-      // 并行执行
-      const parallelResults = await Promise.all(
-        inputs.filter(i => i.name === input.name).map(i => tool.handler!(i, context))
-      )
-      results.push(...parallelResults)
+// src/services/tools/toolOrchestration.ts:19
+export async function* runTools(
+  toolUseMessages: ToolUseBlock[],
+  assistantMessages: AssistantMessage[],
+  canUseTool: CanUseToolFn,
+  toolUseContext: ToolUseContext,
+): AsyncGenerator<MessageUpdate, void, void> {
+  for (const { isConcurrencySafe, blocks } of partitionToolCalls(
+    toolUseMessages,
+    toolUseContext,
+  )) {
+    if (isConcurrencySafe) {
+      // 连续的并发安全（只读）工具 → 并发批
+      yield* runToolsConcurrently(blocks, ...)
     } else {
-      // 串行执行
-      const result = await tool.handler!(input, context)
-      results.push(result)
+      // 非并发安全（写）工具 → 串行批
+      yield* runToolsSerially(blocks, ...)
     }
   }
-  
-  return results
 }
 ```
+
+并发判定不依赖调用里写 `parallel` 字段，而是每个工具实现 `isConcurrencySafe(input)`（如 Read/Glob/Grep 返回 true；Bash/Edit/Write 返回 false），见 `partitionToolCalls`（`toolOrchestration.ts:100`）。并发上限为 `CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY`（默认 10）。
 
 ## 5. 核心工具详解
 
@@ -287,7 +265,7 @@ const FileEditTool: Tool = {
 
 ### 5.3 GrepTool (`src/tools/GrepTool/`)
 
-使用 Ripgrep 进行内容搜索：
+使用 Ripgrep 进行内容搜索（真实输入参数以 `src/tools/GrepTool/prompt.ts` 为准，支持正则、文件过滤、多路径、输出模式等字段）：
 
 ```typescript
 const GrepTool: Tool = {
@@ -296,31 +274,15 @@ const GrepTool: Tool = {
   input_schema: {
     type: 'object',
     properties: {
-      pattern: { type: 'string' },
-      path: { type: 'string' },
-      case_sensitive: { type: 'boolean', default: false },
-      recursive: { type: 'boolean', default: true },
-      context_lines: { type: 'number', default: 0 },
+      pattern: { type: 'string', description: '正则表达式' },
+      path: { type: 'array', items: { type: 'string' }, description: '搜索路径（可为多个）' },
+      glob: { type: 'string', description: '文件名过滤' },
+      output_mode: { type: 'string', enum: ['content', 'files_with_matches', 'count'] },
+      // ...
     },
     required: ['pattern'],
   },
-  handler: async (input, context) => {
-    const args = [
-      input.pattern,
-      input.path ?? '.',
-      '--json',
-      input.case_sensitive ? '' : '-i',
-      input.recursive ? '-r' : '',
-    ].filter(Boolean)
-    
-    const result = await spawn('rg', args)
-    const matches = parseRipgrepJson(result.stdout)
-    
-    return {
-      tool_use_id: input.tool_use_id,
-      content: JSON.stringify(matches),
-    }
-  },
+  // call() 内部 spawn 'rg'，解析输出后返回匹配结果
 }
 ```
 
@@ -366,34 +328,23 @@ const AgentTool: Tool = {
 
 ## 6. MCP 工具 (`src/tools/MCPTool/`)
 
-MCP 工具是对 Model Context Protocol 服务器工具的封装：
+MCP 工具是对 Model Context Protocol 服务器工具的封装。命名格式为**双下划线** `mcp__{serverName}__{toolName}`（见 `src/services/mcp/mcpStringUtils.ts:40`）：
 
 ```typescript
-export class MCPTool implements Tool {
-  name: string
-  description: string
-  input_schema: ToolInputJSONSchema
-  
-  constructor(
-    private serverName: string,
-    private mcpTool: McpServerTool,
-  ) {
-    this.name = `mcp_${serverName}_${mcpTool.name}`
-    this.description = mcpTool.description
-    this.input_schema = mcpTool.inputSchema
-  }
-  
-  async handler(input: ToolInput, context: ExecutionContext): Promise<ToolResult> {
-    // 1. 获取 MCP 客户端
-    const client = getMcpClient(this.serverName)
-    
-    // 2. 调用工具
-    const result = await client.callTool(this.mcpTool.name, input.params)
-    
-    return {
-      tool_use_id: input.tool_use_id,
-      content: formatToolResult(result),
-    }
+// src/tools/MCPTool/MCPTool.ts（结构示意，字段以源码为准）
+class MCPTool {
+  name = `mcp__${serverName}__${mcpTool.name}`   // 双下划线分隔
+  description = mcpTool.description
+  input_schema = mcpTool.inputSchema
+
+  async call(input, context) {
+    // 通过 MCPConnectionManager 获取对应 server 的 client
+    const client = getMcpClientForServer(this.serverName)
+    const result = await client.callTool({
+      name: this.mcpTool.name,
+      arguments: input,
+    })
+    return formatToolResult(result)
   }
 }
 ```
@@ -402,44 +353,37 @@ export class MCPTool implements Tool {
 
 ### 7.1 权限模式
 
+真实模式集合见 `src/types/permissions.ts:16-38`（外部可见模式 + 门控内部模式）：
+
 | 模式 | 描述 | 行为 |
 |------|------|------|
-| `auto` | 自动模式 | 首次使用时请求权限 |
-| `bypass` | 绕过模式 | 所有工具直接执行 |
-| `haiku` | Haiku 模式 | 限制性最强的模式 |
-| `localRecovery` | 本地恢复 | 最小权限 |
+| `default` | 默认模式 | 需要权限的操作询问用户 |
+| `acceptEdits` | 接受编辑 | 工作目录内的文件编辑自动放行 |
+| `plan` | 计划模式 | 只读探索，等价于受限执行 |
+| `bypassPermissions` | 绕过模式 | 跳过大部分权限检查（安全规则仍执行） |
+| `dontAsk` | 不询问 | 所有 'ask' 转为 'deny'（非交互场景） |
+| `auto` | 自动模式 | AI 分类器自动决策（`TRANSCRIPT_CLASSIFIER` 特性门控） |
 
 ### 7.2 权限请求
 
-```typescript
-interface PermissionRequest {
-  tool: Tool
-  params: Record<string, unknown>
-  reason: string
-  userConfirmation?: Promise<boolean>
-}
-```
+权限决策的完整管线（规则检查 → 模式决策 → 分类器 → 4 路竞争）在第 10 章展开。
 
-### 7.3 权限存储
+### 7.3 权限规则存储
 
-权限决策存储在 `.claude/settings.json`：
+权限规则存储在 `~/.claude/settings.json` / 项目 `.claude/settings.json` 的 `permissions` 键（真实 schema 见 `src/utils/settings/types.ts:42`）：
 
 ```json
 {
   "permissions": {
-    "toolPermissions": {
-      "Bash": {
-        "allowed": true,
-        "lastAllowed": "2026-01-15T10:30:00Z"
-      },
-      "Read": {
-        "allowed": true,
-        "lastAllowed": "2026-01-15T10:30:00Z"
-      }
-    }
+    "allow": ["Bash(git status:*)", "Read(~/.zshrc)"],
+    "deny": ["Bash(rm:*)"],
+    "ask": ["Bash(npm publish:*)"],
+    "defaultMode": "acceptEdits"
   }
 }
 ```
+
+规则格式为 `ToolName`、`ToolName(specifier)` 或 MCP 的 `mcp__server`、`mcp__server__tool`。
 
 ## 8. 工具调用协议
 
@@ -450,7 +394,7 @@ Anthropic API 使用 `tool_calls` 格式：
 ```typescript
 // API 请求
 {
-  model: 'claude-opus-4-7-20251120',
+  model: 'claude-sonnet-4-6',   // 示例；别名见 src/utils/model/aliases.ts
   max_tokens: 4096,
   tools: [
     {
@@ -506,45 +450,29 @@ Anthropic API 使用 `tool_calls` 格式：
 
 ## 9. 自定义工具
 
-用户可以在 `.claude/tools/` 目录添加自定义工具：
+CLI 本身没有 `.claude/tools/` 用户自定义工具目录——扩展 Agent 能力的三条真实途径是：
 
-```typescript
-// .claude/tools/myCustomTool.ts
-export const myCustomTool = {
-  name: 'MyCustom',
-  description: 'A custom tool',
-  input_schema: {
-    type: 'object',
-    properties: {
-      input: { type: 'string' }
-    },
-    required: ['input']
-  },
-  handler: async (input, context) => {
-    // 自定义逻辑
-    return {
-      tool_use_id: input.tool_use_id,
-      content: `Processed: ${input.input}`,
-    }
-  }
-}
-```
+1. **MCP 服务器**：在 `.mcp.json`（项目）或 `~/.claude.json`（用户）配置，工具以 `mcp__server__tool` 暴露
+2. **Skills**：`.claude/skills/` 下 Markdown + frontmatter，可带 `allowed-tools`（见第 12 章）
+3. **插件**：`~/.claude/plugins/<name>/` 提供 skills/mcp/hooks/commands 组合（见第 16 章）
 
 ## 10. 调试工具
 
-### 10.1 工具日志
+### 10.1 工具调试
 
-```typescript
-// 启用工具调试
-process.env.CLAUDE_CODE_TOOL_DEBUG = '1'
+调试相关开关（部分为实验性，随版本演进，以 `--help`/源码为准）：
+
+```bash
+# 启用调试日志输出到 stderr
+claude-haha --debug-to-stderr
+
+# 写入指定调试日志文件
+claude-haha --debug-file /tmp/cc-debug.log
+
+# MCP 调试模式
+claude-haha --mcp-debug
 ```
 
 ### 10.2 工具追踪
 
-```typescript
-import { traceTool } from '../utils/trace.js'
-
-async function tracedHandler(input, context) {
-  return traceTool(input.name, () => handler(input, context))
-}
-```
+遥测事件贯穿工具生命周期（`src/services/tools/toolExecution.ts` 内置）：工具开始/结束/失败都会打 `logEvent`，配合 `--debug` 可观察每次工具调用的权限决策、hook 执行与耗时。
