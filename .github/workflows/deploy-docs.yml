@@ -22,12 +22,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6
         with:
           node-version: 22
           cache: npm
@@ -38,10 +38,16 @@ jobs:
       - name: Build VitePress
         run: npm run docs:build
 
+      # peaceiris/actions-mdbook@v2 still runs on the deprecated node20 runtime
+      # (node24 only exists on its unreleased main), so install the official
+      # binary directly instead.
       - name: Setup mdBook
-        uses: peaceiris/actions-mdbook@v2
-        with:
-          mdbook-version: '0.4.44'
+        run: |
+          MDBOOK_VERSION=0.4.44
+          curl -fsSL \
+            "https://github.com/rust-lang/mdBook/releases/download/v${MDBOOK_VERSION}/mdbook-v${MDBOOK_VERSION}-x86_64-unknown-linux-gnu.tar.gz" \
+            | tar -xz -C /usr/local/bin
+          mdbook --version
 
       - name: Build mdBook
         run: mdbook build mdbook
@@ -50,7 +56,7 @@ jobs:
         run: cp -r mdbook/book docs/.vitepress/dist/mdbook
 
       - name: Deploy to gh-pages
-        uses: peaceiris/actions-gh-pages@v4
+        uses: peaceiris/actions-gh-pages@v4.1.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: docs/.vitepress/dist
